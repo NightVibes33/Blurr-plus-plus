@@ -8,11 +8,14 @@
 static NSString *const kGuestService = @"com.xd.mbp31.persistent-guest";
 static NSString *const kGuestAccount = @"install-id";
 static NSString *const kGuestDefaultsKey = @"MBPStableGuestInstallID";
+static NSString *const kUserChangedNotification = @"MBUserStatusChangedNotification";
 
-static const void *kOrigDidLoadKey = &kOrigDidLoadKey;
-static const void *kOrigWillAppearKey = &kOrigWillAppearKey;
 static const void *kOrigDidAppearKey = &kOrigDidAppearKey;
+static BOOL gBootstrapStarted = NO;
 static BOOL gInstalledMainRoot = NO;
+static id gBootstrapController = nil;
+static __weak UIViewController *gLoginController = nil;
+static id gUserObserver = nil;
 
 static NSDictionary *MBPKeychainIdentityQuery(void) {
     return @{
@@ -45,39 +48,12 @@ static NSString *MBPStableInstallID(void) {
     NSMutableDictionary *item = [MBPKeychainIdentityQuery() mutableCopy];
     item[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
     item[(__bridge id)kSecValueData] = data;
-
     SecItemDelete((__bridge CFDictionaryRef)MBPKeychainIdentityQuery());
-    OSStatus addStatus = SecItemAdd((__bridge CFDictionaryRef)item, NULL);
-    if (addStatus != errSecSuccess && addStatus != errSecDuplicateItem) {
-        NSLog(@"[MBPGuestBootstrap] Keychain save failed: %d", (int)addStatus);
-    }
+    SecItemAdd((__bridge CFDictionaryRef)item, NULL);
 
     [[NSUserDefaults standardUserDefaults] setObject:generated forKey:kGuestDefaultsKey];
     [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"MBPPersistentGuestEnabled"];
     return generated;
-}
-
-static BOOL MBPIsMovieBoxLoginController(id object) {
-    if (!object) return NO;
-    NSString *name = NSStringFromClass([object class]);
-    if (!name.length) return NO;
-    return [name containsString:@"MBLoginBaseViewController"] ||
-           [name containsString:@"MBCodeLoginViewController"] ||
-           [name containsString:@"MBInvitationCodeLoginController"] ||
-           [name containsString:@"TVCodeLoginController"];
-}
-
-static NSValue *MBPFindOriginalValue(Class cls, const void *key) {
-    for (Class current = cls; current != Nil; current = class_getSuperclass(current)) {
-        NSValue *value = objc_getAssociatedObject((id)current, key);
-        if (value) return value;
-    }
-    return nil;
-}
-
-static IMP MBPOriginalIMP(id self, const void *key) {
-    NSValue *value = MBPFindOriginalValue([self class], key);
-    return value ? [value pointerValue] : NULL;
 }
 
 static Class MBPFindClass(NSArray<NSString *> *names) {
@@ -89,6 +65,15 @@ static Class MBPFindClass(NSArray<NSString *> *names) {
     return Nil;
 }
 
+static BOOL MBPIsMovieBoxLoginController(id object) {
+    if (!object) return NO;
+    NSString *name = NSStringFromClass([object class]);
+    return [name containsString:@"MBLoginBaseViewController"] ||
+           [name containsString:@"MBCodeLoginViewController"] ||
+           [name containsString:@"MBInvitationCodeLoginController"] ||
+           [name containsString:@"TVCodeLoginController"];
+}
+
 static UIWindow *MBPWindowForController(UIViewController *vc) {
     UIWindow *window = vc.viewIfLoaded.window;
     if (window) return window;
@@ -96,7 +81,14 @@ static UIWindow *MBPWindowForController(UIViewController *vc) {
     if (window) return window;
     window = vc.presentingViewController.viewIfLoaded.window;
     if (window) return window;
-    return nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        for (UIWindow *candidate in ((UIWindowScene *)scene).windows) {
+            if (candidate.isKeyWindow) return candidate;
+            if (!window && candidate.rootViewController) window = candidate;
+        }
+    }
+    return window;
 }
 
 static UIViewController *MBPCreateMainController(void) {
@@ -105,53 +97,23 @@ static UIViewController *MBPCreateMainController(void) {
         @"_TtC12GoogleAdsSDK18MBTabBarController",
         @"MBTabBarController"
     ]);
-    if (!cls) {
-        NSLog(@"[MBPGuestBootstrap] MBTabBarController class not found");
-        return nil;
-    }
-
+    if (!cls) return nil;
     id obj = ((id (*)(id, SEL))objc_msgSend)((id)cls, @selector(alloc));
     obj = ((id (*)(id, SEL))objc_msgSend)(obj, @selector(init));
-    if (![obj isKindOfClass:UIViewController.class]) {
-        NSLog(@"[MBPGuestBootstrap] MBTabBarController init failed");
-        return nil;
-    }
-    return (UIViewController *)obj;
+    return [obj isKindOfClass:UIViewController.class] ? obj : nil;
 }
 
-static void MBPDismissSecondaryLogin(UIViewController *vc) {
-    if (!vc) return;
-    if (vc.presentingViewController) {
-        [vc.presentingViewController dismissViewControllerAnimated:NO completion:nil];
-        return;
-    }
-    UINavigationController *nav = vc.navigationController;
-    if (nav && nav.topViewController == vc && nav.viewControllers.count > 1) {
-        [nav popViewControllerAnimated:NO];
-    }
-}
-
-static void MBPRouteFromLogin(UIViewController *loginVC, NSInteger attempt) {
-    if (!loginVC || !MBPIsMovieBoxLoginController(loginVC)) return;
-    MBPStableInstallID();
-
-    if (gInstalledMainRoot) {
-        MBPDismissSecondaryLogin(loginVC);
-        return;
-    }
-
+static void MBPRouteToMain(void) {
+    if (gInstalledMainRoot) return;
+    UIViewController *loginVC = gLoginController;
     UIWindow *window = MBPWindowForController(loginVC);
-    if (!window) {
-        if (attempt < 25) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.04 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                MBPRouteFromLogin(loginVC, attempt + 1);
-            });
-        }
+    UIViewController *main = MBPCreateMainController();
+    if (!window || !main) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!gInstalledMainRoot) MBPRouteToMain();
+        });
         return;
     }
-
-    UIViewController *main = MBPCreateMainController();
-    if (!main) return;
 
     gInstalledMainRoot = YES;
     [UIView performWithoutAnimation:^{
@@ -159,27 +121,139 @@ static void MBPRouteFromLogin(UIViewController *loginVC, NSInteger attempt) {
         [window makeKeyAndVisible];
         [window layoutIfNeeded];
     }];
-    NSLog(@"[MBPGuestBootstrap] Installed MBTabBarController as main root");
+    NSLog(@"[MBPGuestBootstrap] session accepted; installed MBTabBarController");
 }
 
-static void MBPLoginDidLoad(id self, SEL _cmd) {
-    IMP original = MBPOriginalIMP(self, kOrigDidLoadKey);
-    if (original && original != (IMP)MBPLoginDidLoad) {
-        ((void (*)(id, SEL))original)(self, _cmd);
-    }
-    MBPStableInstallID();
+static UIView *MBPBootstrapCover(UIViewController *vc) {
+    UIView *cover = [vc.view viewWithTag:0x4D425047];
+    if (cover) return cover;
+
+    cover = [[UIView alloc] initWithFrame:vc.view.bounds];
+    cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    cover.backgroundColor = UIColor.blackColor;
+    cover.tag = 0x4D425047;
+
+    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+    spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    [spinner startAnimating];
+
+    UILabel *label = [[UILabel alloc] init];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    label.text = @"Setting up your profile…";
+    label.textColor = UIColor.whiteColor;
+    label.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+
+    [cover addSubview:spinner];
+    [cover addSubview:label];
+    [NSLayoutConstraint activateConstraints:@[
+        [spinner.centerXAnchor constraintEqualToAnchor:cover.centerXAnchor],
+        [spinner.centerYAnchor constraintEqualToAnchor:cover.centerYAnchor constant:-18],
+        [label.centerXAnchor constraintEqualToAnchor:cover.centerXAnchor],
+        [label.topAnchor constraintEqualToAnchor:spinner.bottomAnchor constant:18]
+    ]];
+    [vc.view addSubview:cover];
+    return cover;
 }
 
-static void MBPLoginWillAppear(id self, SEL _cmd, BOOL animated) {
-    IMP original = MBPOriginalIMP(self, kOrigWillAppearKey);
-    if (original && original != (IMP)MBPLoginWillAppear) {
-        ((void (*)(id, SEL, BOOL))original)(self, _cmd, animated);
+static void MBPShowBootstrapFailure(NSString *message) {
+    UIViewController *vc = gLoginController;
+    if (!vc) return;
+    UIView *cover = MBPBootstrapCover(vc);
+    for (UIView *subview in cover.subviews) [subview removeFromSuperview];
+
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectInset(cover.bounds, 28, 80)];
+    label.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    label.numberOfLines = 0;
+    label.textAlignment = NSTextAlignmentCenter;
+    label.textColor = UIColor.whiteColor;
+    label.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    label.text = message;
+    [cover addSubview:label];
+}
+
+static NSString *MBPSanitizedInstallID(void) {
+    NSString *raw = [[MBPStableInstallID() stringByReplacingOccurrencesOfString:@"-" withString:@""] lowercaseString];
+    if (raw.length > 16) raw = [raw substringToIndex:16];
+    return raw;
+}
+
+static void MBPAttemptNativeRegistration(UIViewController *loginVC) {
+    if (gBootstrapStarted) return;
+    gBootstrapStarted = YES;
+    gLoginController = loginVC;
+    MBPBootstrapCover(loginVC);
+
+    if (!gUserObserver) {
+        gUserObserver = [[NSNotificationCenter defaultCenter] addObserverForName:kUserChangedNotification
+                                                                         object:nil
+                                                                          queue:NSOperationQueue.mainQueue
+                                                                     usingBlock:^(__unused NSNotification *note) {
+            NSLog(@"[MBPGuestBootstrap] MBUserStatusChangedNotification received");
+            MBPRouteToMain();
+        }];
     }
-    MBPStableInstallID();
+
+    Class accountClass = MBPFindClass(@[
+        @"GoogleAdsSDK.MBAccountViewController",
+        @"_TtC12GoogleAdsSDK23MBAccountViewController",
+        @"MBAccountViewController"
+    ]);
+    SEL registerSel = NSSelectorFromString(@"thirdPartRegesterWithUsername:userInfo:invitationCode:");
+    if (!accountClass || !class_getInstanceMethod(accountClass, registerSel)) {
+        MBPShowBootstrapFailure(@"Automatic profile setup is unavailable in this build (registration selector not found).");
+        return;
+    }
+
+    id controller = ((id (*)(id, SEL))objc_msgSend)((id)accountClass, @selector(alloc));
+    controller = ((id (*)(id, SEL))objc_msgSend)(controller, @selector(init));
+    if (!controller) {
+        MBPShowBootstrapFailure(@"Automatic profile setup could not initialize the account controller.");
+        return;
+    }
+    gBootstrapController = controller;
+
+    NSString *idPart = MBPSanitizedInstallID();
+    NSString *username = [@"guest" stringByAppendingString:[idPart substringToIndex:MIN((NSUInteger)12, idPart.length)]];
+    NSString *email = [NSString stringWithFormat:@"%@@example.com", username];
+
+    /*
+     * MBAccountViewController's native registration code reads exactly these
+     * userInfo keys, generates its own six-character password, hard-codes the
+     * provider type to "google", and sends RegisterV3 through MovieBox's own
+     * HTTPS/encryption stack. We intentionally call that native path instead
+     * of recreating the protocol in this dylib.
+     */
+    NSDictionary *userInfo = @{
+        @"email": email,
+        @"id_token": MBPStableInstallID(),
+        @"name": username
+    };
+
+    NSLog(@"[MBPGuestBootstrap] starting native RegisterV3 bootstrap for %@", username);
+    ((void (*)(id, SEL, NSString *, NSDictionary *, NSString *))objc_msgSend)(controller,
+                                                                              registerSel,
+                                                                              username,
+                                                                              userInfo,
+                                                                              @"");
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!gInstalledMainRoot) {
+            MBPShowBootstrapFailure(@"Automatic profile setup did not produce a valid session. The server rejected or did not complete the native registration request.");
+        }
+    });
+}
+
+static NSValue *MBPOriginalValue(Class cls) {
+    for (Class current = cls; current != Nil; current = class_getSuperclass(current)) {
+        NSValue *value = objc_getAssociatedObject((id)current, kOrigDidAppearKey);
+        if (value) return value;
+    }
+    return nil;
 }
 
 static void MBPLoginDidAppear(id self, SEL _cmd, BOOL animated) {
-    IMP original = MBPOriginalIMP(self, kOrigDidAppearKey);
+    NSValue *stored = MBPOriginalValue([self class]);
+    IMP original = stored ? [stored pointerValue] : NULL;
     if (original && original != (IMP)MBPLoginDidAppear) {
         ((void (*)(id, SEL, BOOL))original)(self, _cmd, animated);
     }
@@ -187,31 +261,27 @@ static void MBPLoginDidAppear(id self, SEL _cmd, BOOL animated) {
     if ([self isKindOfClass:UIViewController.class]) {
         UIViewController *vc = (UIViewController *)self;
         dispatch_async(dispatch_get_main_queue(), ^{
-            MBPRouteFromLogin(vc, 0);
+            MBPAttemptNativeRegistration(vc);
         });
     }
 }
 
-static BOOL MBPInstallIsolatedHook(Class cls, SEL selector, IMP replacement, const void *key) {
+static BOOL MBPHookClass(Class cls) {
     if (!cls) return NO;
-    if (objc_getAssociatedObject((id)cls, key)) return YES;
-
-    Method inherited = class_getInstanceMethod(cls, selector);
+    if (objc_getAssociatedObject((id)cls, kOrigDidAppearKey)) return YES;
+    Method inherited = class_getInstanceMethod(cls, @selector(viewDidAppear:));
     if (!inherited) return NO;
-
     IMP original = method_getImplementation(inherited);
     const char *types = method_getTypeEncoding(inherited);
     if (!original || !types) return NO;
 
-    if (!class_addMethod(cls, selector, replacement, types)) {
-        Method own = class_getInstanceMethod(cls, selector);
+    if (!class_addMethod(cls, @selector(viewDidAppear:), (IMP)MBPLoginDidAppear, types)) {
+        Method own = class_getInstanceMethod(cls, @selector(viewDidAppear:));
         if (!own) return NO;
         original = method_getImplementation(own);
-        if (original == replacement) return YES;
-        method_setImplementation(own, replacement);
+        if (original != (IMP)MBPLoginDidAppear) method_setImplementation(own, (IMP)MBPLoginDidAppear);
     }
-
-    objc_setAssociatedObject((id)cls, key, [NSValue valueWithPointer:original], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject((id)cls, kOrigDidAppearKey, [NSValue valueWithPointer:original], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return YES;
 }
 
@@ -222,23 +292,16 @@ static BOOL MBPHookLoginClasses(void) {
         @[@"GoogleAdsSDK.MBInvitationCodeLoginController", @"_TtC12GoogleAdsSDK31MBInvitationCodeLoginController", @"MBInvitationCodeLoginController"],
         @[@"GoogleAdsSDK.TVCodeLoginController", @"_TtC12GoogleAdsSDK21TVCodeLoginController", @"TVCodeLoginController"]
     ];
-
-    BOOL foundAny = NO;
+    BOOL found = NO;
     for (NSArray<NSString *> *names in groups) {
         Class cls = MBPFindClass(names);
-        if (!cls) continue;
-        foundAny = YES;
-        MBPInstallIsolatedHook(cls, @selector(viewDidLoad), (IMP)MBPLoginDidLoad, kOrigDidLoadKey);
-        MBPInstallIsolatedHook(cls, @selector(viewWillAppear:), (IMP)MBPLoginWillAppear, kOrigWillAppearKey);
-        MBPInstallIsolatedHook(cls, @selector(viewDidAppear:), (IMP)MBPLoginDidAppear, kOrigDidAppearKey);
+        if (cls) found |= MBPHookClass(cls);
     }
-    return foundAny;
+    return found;
 }
 
-static void MBPInstallHooksWhenSafe(void) {
-    MBPStableInstallID();
+static void MBPInstallHooks(void) {
     if (MBPHookLoginClasses()) return;
-
     __block NSInteger attempts = 0;
     __block void (^retry)(void) = nil;
     retry = ^{
@@ -256,8 +319,6 @@ __attribute__((constructor))
 static void MBPGuestBootstrapInit(void) {
     @autoreleasepool {
         MBPStableInstallID();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            MBPInstallHooksWhenSafe();
-        });
+        dispatch_async(dispatch_get_main_queue(), ^{ MBPInstallHooks(); });
     }
 }
