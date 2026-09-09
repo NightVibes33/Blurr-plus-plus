@@ -78,6 +78,7 @@ jobs:
             patch/GuestBootstrap.m \
             -framework Foundation \
             -framework UIKit \
+            -framework CoreGraphics \
             -framework Security \
             '-Wl,-install_name,@executable_path/Frameworks/MBPGuestBootstrap.dylib' \
             -o work/build/MBPGuestBootstrap.dylib
