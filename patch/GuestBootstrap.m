@@ -9,8 +9,9 @@ static NSString *const kGuestService = @"com.xd.mbp31.persistent-guest";
 static NSString *const kGuestAccount = @"install-id";
 static NSString *const kGuestDefaultsKey = @"MBPStableGuestInstallID";
 
-static IMP gPresentIMP = NULL;
-static IMP gPushIMP = NULL;
+static const void *kOrigDidLoadKey = &kOrigDidLoadKey;
+static const void *kOrigWillAppearKey = &kOrigWillAppearKey;
+static const void *kOrigDidAppearKey = &kOrigDidAppearKey;
 
 static NSDictionary *MBPKeychainIdentityQuery(void) {
     return @{
@@ -55,47 +56,51 @@ static NSString *MBPStableInstallID(void) {
     return generated;
 }
 
-static BOOL MBPIsMovieBoxLoginController(id controller) {
-    if (!controller) return NO;
-    NSString *name = NSStringFromClass([controller class]);
+static BOOL MBPIsMovieBoxLoginController(id object) {
+    if (!object) return NO;
+    NSString *name = NSStringFromClass([object class]);
     if (!name.length) return NO;
 
-    static NSArray<NSString *> *blocked;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        blocked = @[
-            @"MBLoginBaseViewController",
-            @"MBCodeLoginViewController",
-            @"MBInvitationCodeLoginController",
-            @"TVCodeLoginController"
-        ];
-    });
-
-    for (NSString *needle in blocked) {
-        if ([name containsString:needle]) return YES;
-    }
-    return NO;
+    return [name containsString:@"MBLoginBaseViewController"] ||
+           [name containsString:@"MBCodeLoginViewController"] ||
+           [name containsString:@"MBInvitationCodeLoginController"] ||
+           [name containsString:@"TVCodeLoginController"];
 }
 
-static void MBPDismissLoginController(UIViewController *vc) {
+static NSValue *MBPFindOriginalValue(Class cls, const void *key) {
+    for (Class current = cls; current != Nil; current = class_getSuperclass(current)) {
+        NSValue *value = objc_getAssociatedObject((id)current, key);
+        if (value) return value;
+    }
+    return nil;
+}
+
+static IMP MBPOriginalIMP(id self, const void *key) {
+    NSValue *value = MBPFindOriginalValue([self class], key);
+    return value ? [value pointerValue] : NULL;
+}
+
+static void MBPCloseLoginController(UIViewController *vc) {
     if (!vc || !MBPIsMovieBoxLoginController(vc)) return;
-    MBPStableInstallID();
+
     vc.view.hidden = YES;
     vc.view.userInteractionEnabled = NO;
 
     SEL close = NSSelectorFromString(@"close");
-    SEL closeController = NSSelectorFromString(@"closeContrller");
     if ([vc respondsToSelector:close]) {
         ((void (*)(id, SEL))objc_msgSend)(vc, close);
         return;
     }
+
+    SEL closeController = NSSelectorFromString(@"closeContrller");
     if ([vc respondsToSelector:closeController]) {
         ((void (*)(id, SEL))objc_msgSend)(vc, closeController);
         return;
     }
 
-    if (vc.presentingViewController) {
-        [vc.presentingViewController dismissViewControllerAnimated:NO completion:nil];
+    UIViewController *presenter = vc.presentingViewController;
+    if (presenter) {
+        [presenter dismissViewControllerAnimated:NO completion:nil];
         return;
     }
 
@@ -105,73 +110,48 @@ static void MBPDismissLoginController(UIViewController *vc) {
     }
 }
 
-static UIViewController *MBPTopController(UIViewController *vc) {
-    if (!vc) return nil;
-    if (vc.presentedViewController) return MBPTopController(vc.presentedViewController);
-    if ([vc isKindOfClass:UINavigationController.class]) {
-        return MBPTopController(((UINavigationController *)vc).visibleViewController);
+static void MBPLoginDidLoad(id self, SEL _cmd) {
+    IMP original = MBPOriginalIMP(self, kOrigDidLoadKey);
+    if (original && original != (IMP)MBPLoginDidLoad) {
+        ((void (*)(id, SEL))original)(self, _cmd);
     }
-    if ([vc isKindOfClass:UITabBarController.class]) {
-        return MBPTopController(((UITabBarController *)vc).selectedViewController);
-    }
-    for (UIViewController *child in vc.childViewControllers) {
-        UIViewController *top = MBPTopController(child);
-        if (top && top != child) return top;
-        if (MBPIsMovieBoxLoginController(child)) return child;
-    }
-    return vc;
-}
 
-static void MBPSweepVisibleLogin(void) {
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (![scene isKindOfClass:UIWindowScene.class]) continue;
-        UIWindowScene *windowScene = (UIWindowScene *)scene;
-        for (UIWindow *window in windowScene.windows) {
-            UIViewController *top = MBPTopController(window.rootViewController);
-            if (MBPIsMovieBoxLoginController(top)) MBPDismissLoginController(top);
-        }
-    }
-}
-
-static void MBPPresentReplacement(id self, SEL _cmd, UIViewController *controller, BOOL animated, void (^completion)(void)) {
-    if (MBPIsMovieBoxLoginController(controller)) {
-        MBPStableInstallID();
-        if (completion) completion();
-        return;
-    }
-    if (gPresentIMP) {
-        ((void (*)(id, SEL, UIViewController *, BOOL, void (^)(void)))gPresentIMP)(self, _cmd, controller, animated, completion);
-    }
-}
-
-static void MBPPushReplacement(id self, SEL _cmd, UIViewController *controller, BOOL animated) {
-    if (MBPIsMovieBoxLoginController(controller)) {
-        MBPStableInstallID();
-        return;
-    }
-    if (gPushIMP) {
-        ((void (*)(id, SEL, UIViewController *, BOOL))gPushIMP)(self, _cmd, controller, animated);
-    }
-}
-
-static BOOL MBPFalseBool(id self, SEL _cmd) {
-    return NO;
-}
-
-static void MBPLoginViewDidLoad(id self, SEL _cmd) {
     MBPStableInstallID();
     if ([self isKindOfClass:UIViewController.class]) {
         UIViewController *vc = (UIViewController *)self;
-        vc.view = [[UIView alloc] initWithFrame:UIScreen.mainScreen.bounds];
         vc.view.hidden = YES;
-        dispatch_async(dispatch_get_main_queue(), ^{ MBPDismissLoginController(vc); });
+        vc.view.userInteractionEnabled = NO;
     }
 }
 
-static void MBPLoginViewDidAppear(id self, SEL _cmd, BOOL animated) {
+static void MBPLoginWillAppear(id self, SEL _cmd, BOOL animated) {
+    IMP original = MBPOriginalIMP(self, kOrigWillAppearKey);
+    if (original && original != (IMP)MBPLoginWillAppear) {
+        ((void (*)(id, SEL, BOOL))original)(self, _cmd, animated);
+    }
+
     MBPStableInstallID();
     if ([self isKindOfClass:UIViewController.class]) {
-        MBPDismissLoginController((UIViewController *)self);
+        UIViewController *vc = (UIViewController *)self;
+        vc.view.hidden = YES;
+        vc.view.userInteractionEnabled = NO;
+    }
+}
+
+static void MBPLoginDidAppear(id self, SEL _cmd, BOOL animated) {
+    IMP original = MBPOriginalIMP(self, kOrigDidAppearKey);
+    if (original && original != (IMP)MBPLoginDidAppear) {
+        ((void (*)(id, SEL, BOOL))original)(self, _cmd, animated);
+    }
+
+    MBPStableInstallID();
+    if ([self isKindOfClass:UIViewController.class]) {
+        UIViewController *vc = (UIViewController *)self;
+        vc.view.hidden = YES;
+        vc.view.userInteractionEnabled = NO;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MBPCloseLoginController(vc);
+        });
     }
 }
 
@@ -184,32 +164,35 @@ static Class MBPFindClass(NSArray<NSString *> *names) {
     return Nil;
 }
 
-static void MBPReplaceInstanceMethod(Class cls, SEL sel, IMP replacement) {
-    if (!cls) return;
-    Method method = class_getInstanceMethod(cls, sel);
-    if (!method) return;
-    class_replaceMethod(cls, sel, replacement, method_getTypeEncoding(method));
-}
+static BOOL MBPInstallIsolatedHook(Class cls, SEL selector, IMP replacement, const void *key) {
+    if (!cls) return NO;
+    if (objc_getAssociatedObject((id)cls, key)) return YES;
 
-static void MBPHookNeedInvitationCode(void) {
-    int count = objc_getClassList(NULL, 0);
-    if (count <= 0) return;
-    Class *classes = (__unsafe_unretained Class *)calloc((size_t)count, sizeof(Class));
-    count = objc_getClassList(classes, count);
-    SEL sel = NSSelectorFromString(@"needInvitationCode");
+    Method inherited = class_getInstanceMethod(cls, selector);
+    if (!inherited) return NO;
 
-    for (int i = 0; i < count; i++) {
-        Class cls = classes[i];
-        Method instanceMethod = class_getInstanceMethod(cls, sel);
-        if (instanceMethod) method_setImplementation(instanceMethod, (IMP)MBPFalseBool);
+    IMP original = method_getImplementation(inherited);
+    const char *types = method_getTypeEncoding(inherited);
+    if (!original || !types) return NO;
 
-        Method classMethod = class_getClassMethod(cls, sel);
-        if (classMethod) method_setImplementation(classMethod, (IMP)MBPFalseBool);
+    /*
+     * Always add an override on the target class instead of mutating an
+     * inherited Method. This prevents a login-controller hook from changing
+     * UIViewController (or another superclass) process-wide.
+     */
+    if (!class_addMethod(cls, selector, replacement, types)) {
+        Method own = class_getInstanceMethod(cls, selector);
+        if (!own) return NO;
+        original = method_getImplementation(own);
+        if (original == replacement) return YES;
+        method_setImplementation(own, replacement);
     }
-    free(classes);
+
+    objc_setAssociatedObject((id)cls, key, [NSValue valueWithPointer:original], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return YES;
 }
 
-static void MBPHookLoginClasses(void) {
+static BOOL MBPHookLoginClasses(void) {
     NSArray<NSArray<NSString *> *> *groups = @[
         @[@"GoogleAdsSDK.MBLoginBaseViewController", @"_TtC12GoogleAdsSDK25MBLoginBaseViewController", @"MBLoginBaseViewController"],
         @[@"GoogleAdsSDK.MBCodeLoginViewController", @"_TtC12GoogleAdsSDK25MBCodeLoginViewController", @"MBCodeLoginViewController"],
@@ -217,49 +200,43 @@ static void MBPHookLoginClasses(void) {
         @[@"GoogleAdsSDK.TVCodeLoginController", @"_TtC12GoogleAdsSDK21TVCodeLoginController", @"TVCodeLoginController"]
     ];
 
+    BOOL foundAny = NO;
     for (NSArray<NSString *> *names in groups) {
         Class cls = MBPFindClass(names);
         if (!cls) continue;
-        MBPReplaceInstanceMethod(cls, @selector(viewDidLoad), (IMP)MBPLoginViewDidLoad);
-        MBPReplaceInstanceMethod(cls, @selector(viewDidAppear:), (IMP)MBPLoginViewDidAppear);
+        foundAny = YES;
+        MBPInstallIsolatedHook(cls, @selector(viewDidLoad), (IMP)MBPLoginDidLoad, kOrigDidLoadKey);
+        MBPInstallIsolatedHook(cls, @selector(viewWillAppear:), (IMP)MBPLoginWillAppear, kOrigWillAppearKey);
+        MBPInstallIsolatedHook(cls, @selector(viewDidAppear:), (IMP)MBPLoginDidAppear, kOrigDidAppearKey);
     }
+    return foundAny;
 }
 
-static void MBPHookUIKitRouting(void) {
-    Method present = class_getInstanceMethod(UIViewController.class, @selector(presentViewController:animated:completion:));
-    if (present && method_getImplementation(present) != (IMP)MBPPresentReplacement) {
-        gPresentIMP = method_getImplementation(present);
-        method_setImplementation(present, (IMP)MBPPresentReplacement);
-    }
-
-    Method push = class_getInstanceMethod(UINavigationController.class, @selector(pushViewController:animated:));
-    if (push && method_getImplementation(push) != (IMP)MBPPushReplacement) {
-        gPushIMP = method_getImplementation(push);
-        method_setImplementation(push, (IMP)MBPPushReplacement);
-    }
-}
-
-static void MBPInstallHooks(void) {
+static void MBPInstallHooksWhenSafe(void) {
     MBPStableInstallID();
-    MBPHookUIKitRouting();
-    MBPHookNeedInvitationCode();
-    MBPHookLoginClasses();
-    MBPSweepVisibleLogin();
+
+    if (MBPHookLoginClasses()) return;
+
+    __block NSInteger attempts = 0;
+    __block void (^retry)(void) = nil;
+    retry = ^{
+        attempts++;
+        if (MBPHookLoginClasses() || attempts >= 100) {
+            retry = nil;
+            return;
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), retry);
+    };
+    retry();
 }
 
 __attribute__((constructor))
 static void MBPGuestBootstrapInit(void) {
     @autoreleasepool {
+        /* No UIApplication/UIWindow access and no UIKit superclass swizzling here. */
         MBPStableInstallID();
-        MBPInstallHooks();
-
         dispatch_async(dispatch_get_main_queue(), ^{
-            MBPInstallHooks();
-            for (NSInteger i = 1; i <= 20; i++) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * i * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    MBPInstallHooks();
-                });
-            }
+            MBPInstallHooksWhenSafe();
         });
     }
 }
