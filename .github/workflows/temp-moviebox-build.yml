@@ -1,0 +1,86 @@
+name: Temp MovieBoxPro IPA Build
+
+on:
+  push:
+    branches:
+      - temp/moviebox-persistent-session
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_IPA_URL: https://www.movieboxpro.app/ipa
+  EXPECTED_VERSION: "16.0"
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout temp branch
+        uses: actions/checkout@v4
+
+      - name: Download MovieBoxPro IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work out
+          curl -fL --retry 3 --retry-all-errors \
+            -A 'Mozilla/5.0' \
+            "$SOURCE_IPA_URL" \
+            -o work/MovieBoxPro.ipa
+          ls -lh work/MovieBoxPro.ipa
+          test -s work/MovieBoxPro.ipa
+
+      - name: Validate IPA archive and app metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -tq work/MovieBoxPro.ipa
+          rm -rf work/unpacked
+          mkdir -p work/unpacked
+          ditto -x -k work/MovieBoxPro.ipa work/unpacked
+
+          APP_PATH="$(find work/unpacked/Payload -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          if [ -z "$APP_PATH" ]; then
+            echo 'No .app bundle found under Payload/' >&2
+            exit 1
+          fi
+
+          INFO="$APP_PATH/Info.plist"
+          BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO")"
+          SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO")"
+          BUILD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO")"
+
+          echo "App: $APP_PATH"
+          echo "Bundle ID: $BUNDLE_ID"
+          echo "Version: $SHORT_VERSION ($BUILD_VERSION)"
+
+          if [ "$SHORT_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "Expected MovieBoxPro $EXPECTED_VERSION but downloaded $SHORT_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Repack validated IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work/unpacked
+          ditto -c -k --sequesterRsrc --keepParent Payload ../../out/MovieBoxPro_16.0-temp.ipa
+          cd ../..
+          unzip -tq out/MovieBoxPro_16.0-temp.ipa
+          shasum -a 256 out/MovieBoxPro_16.0-temp.ipa | tee out/SHA256.txt
+          ls -lh out/
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MovieBoxPro-16.0-temp
+          path: |
+            out/MovieBoxPro_16.0-temp.ipa
+            out/SHA256.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
