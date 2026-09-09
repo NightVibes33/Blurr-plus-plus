@@ -114,7 +114,7 @@ static UIViewController *MBPTopController(UIViewController *vc) {
     if ([vc isKindOfClass:UITabBarController.class]) {
         return MBPTopController(((UITabBarController *)vc).selectedViewController);
     }
-    for (UIViewController *child in vc.children) {
+    for (UIViewController *child in vc.childViewControllers) {
         UIViewController *top = MBPTopController(child);
         if (top && top != child) return top;
         if (MBPIsMovieBoxLoginController(child)) return child;
