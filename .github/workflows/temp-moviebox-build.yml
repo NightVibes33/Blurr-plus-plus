@@ -1,4 +1,4 @@
-name: Temp MovieBoxPro Guest Network Diagnostic Build
+name: Temp MovieBoxPro Guest Response Diagnostic Build
 
 on:
   push:
@@ -53,7 +53,7 @@ jobs:
           echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
           echo "EXECUTABLE=$EXECUTABLE" >> "$GITHUB_ENV"
 
-      - name: Build guest client with network diagnostics
+      - name: Build guest client with response diagnostics
         shell: bash
         run: |
           set -euo pipefail
@@ -80,6 +80,7 @@ jobs:
           strings work/build/MBPGuestBootstrap.dylib | grep -F 'movieboxpro-guest-auth.lovable.app/api/public/guest/bootstrap'
           strings work/build/MBPGuestBootstrap.dylib | grep -F 'didCompleteLogin'
           strings work/build/MBPGuestBootstrap.dylib | grep -F 'NET DIAGNOSTIC'
+          strings work/build/MBPGuestBootstrap.dylib | grep -F 'BODY http='
 
       - name: Inject guest client and diagnostics
         shell: bash
@@ -96,17 +97,17 @@ jobs:
         run: |
           set -euo pipefail
           cd work/unpacked
-          ditto -c -k --sequesterRsrc --keepParent Payload ../../out/MovieBoxPro_16.0-guest-network-diagnostic-v12.ipa
+          ditto -c -k --sequesterRsrc --keepParent Payload ../../out/MovieBoxPro_16.0-guest-response-diagnostic-v13.ipa
           cd ../..
-          unzip -tq out/MovieBoxPro_16.0-guest-network-diagnostic-v12.ipa
-          shasum -a 256 out/MovieBoxPro_16.0-guest-network-diagnostic-v12.ipa | tee out/SHA256.txt
+          unzip -tq out/MovieBoxPro_16.0-guest-response-diagnostic-v13.ipa
+          shasum -a 256 out/MovieBoxPro_16.0-guest-response-diagnostic-v13.ipa | tee out/SHA256.txt
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MovieBoxPro-16.0-guest-network-diagnostic-v12
+          name: MovieBoxPro-16.0-guest-response-diagnostic-v13
           path: |
-            out/MovieBoxPro_16.0-guest-network-diagnostic-v12.ipa
+            out/MovieBoxPro_16.0-guest-response-diagnostic-v13.ipa
             out/SHA256.txt
           if-no-files-found: error
           compression-level: 0
