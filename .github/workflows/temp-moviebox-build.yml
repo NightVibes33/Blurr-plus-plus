@@ -1,4 +1,4 @@
-name: Temp MovieBoxPro Owned Guest Build
+name: Temp MovieBoxPro Firebase Guest Build
 
 on:
   push:
@@ -8,11 +8,6 @@ on:
       - 'patch/**'
       - '.github/workflows/temp-moviebox-build.yml'
   workflow_dispatch:
-    inputs:
-      guest_bootstrap_url:
-        description: 'HTTPS URL to your /v1/guest/bootstrap endpoint'
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -21,7 +16,6 @@ env:
   SOURCE_IPA_URL: https://www.movieboxpro.app/ipa
   EXPECTED_VERSION: "16.0"
   EXPECTED_BUNDLE_ID: com.xd.mbp31
-  DEFAULT_GUEST_BOOTSTRAP_URL: https://mbp-guest-auth-bobbytatum12345-5121s-projects.vercel.app/api/guest/bootstrap
 
 jobs:
   build-ipa:
@@ -40,18 +34,10 @@ jobs:
           test -s work/MovieBoxPro.ipa
           unzip -tq work/MovieBoxPro.ipa
 
-      - name: Extract validate and configure target
+      - name: Extract and validate target
         shell: bash
-        env:
-          INPUT_GUEST_BOOTSTRAP_URL: ${{ inputs.guest_bootstrap_url }}
         run: |
           set -euo pipefail
-          GUEST_BOOTSTRAP_URL="${INPUT_GUEST_BOOTSTRAP_URL:-$DEFAULT_GUEST_BOOTSTRAP_URL}"
-          case "$GUEST_BOOTSTRAP_URL" in
-            https://*) ;;
-            *) echo 'guest_bootstrap_url must use HTTPS' >&2; exit 2 ;;
-          esac
-
           rm -rf work/unpacked
           mkdir -p work/unpacked
           ditto -x -k work/MovieBoxPro.ipa work/unpacked
@@ -64,14 +50,16 @@ jobs:
           test "$BUNDLE_ID" = "$EXPECTED_BUNDLE_ID"
           test "$SHORT_VERSION" = "$EXPECTED_VERSION"
           test -f "$APP_PATH/$EXECUTABLE"
-
-          /usr/libexec/PlistBuddy -c 'Delete :MBPGuestBootstrapURL' "$INFO" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Add :MBPGuestBootstrapURL string $GUEST_BOOTSTRAP_URL" "$INFO"
+          test -f "$APP_PATH/GoogleService-Info.plist"
+          FIREBASE_API_KEY="$(/usr/libexec/PlistBuddy -c 'Print :API_KEY' "$APP_PATH/GoogleService-Info.plist")"
+          FIREBASE_PROJECT="$(/usr/libexec/PlistBuddy -c 'Print :PROJECT_ID' "$APP_PATH/GoogleService-Info.plist")"
+          test -n "$FIREBASE_API_KEY"
+          test -n "$FIREBASE_PROJECT"
           echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
           echo "EXECUTABLE=$EXECUTABLE" >> "$GITHUB_ENV"
-          echo "Configured owned guest endpoint: $GUEST_BOOTSTRAP_URL"
+          echo "Firebase project: $FIREBASE_PROJECT"
 
-      - name: Build owned guest bootstrap client
+      - name: Build Firebase guest bootstrap client
         shell: bash
         run: |
           set -euo pipefail
@@ -89,9 +77,10 @@ jobs:
             -framework Security \
             '-Wl,-install_name,@executable_path/Frameworks/MBPGuestBootstrap.dylib' \
             -o work/build/MBPGuestBootstrap.dylib
+          file work/build/MBPGuestBootstrap.dylib
           test -s work/build/MBPGuestBootstrap.dylib
 
-      - name: Inject owned guest client
+      - name: Inject Firebase guest client
         shell: bash
         run: |
           set -euo pipefail
@@ -106,17 +95,17 @@ jobs:
         run: |
           set -euo pipefail
           cd work/unpacked
-          ditto -c -k --sequesterRsrc --keepParent Payload ../../out/MovieBoxPro_16.0-owned-guest.ipa
+          ditto -c -k --sequesterRsrc --keepParent Payload ../../out/MovieBoxPro_16.0-firebase-guest.ipa
           cd ../..
-          unzip -tq out/MovieBoxPro_16.0-owned-guest.ipa
-          shasum -a 256 out/MovieBoxPro_16.0-owned-guest.ipa | tee out/SHA256.txt
+          unzip -tq out/MovieBoxPro_16.0-firebase-guest.ipa
+          shasum -a 256 out/MovieBoxPro_16.0-firebase-guest.ipa | tee out/SHA256.txt
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MovieBoxPro-16.0-owned-guest
+          name: MovieBoxPro-16.0-firebase-guest
           path: |
-            out/MovieBoxPro_16.0-owned-guest.ipa
+            out/MovieBoxPro_16.0-firebase-guest.ipa
             out/SHA256.txt
           if-no-files-found: error
           compression-level: 0
