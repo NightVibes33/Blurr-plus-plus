@@ -1,11 +1,17 @@
 name: Temp MovieBoxPro Owned Guest Build
 
 on:
+  push:
+    branches:
+      - temp/moviebox-persistent-session
+    paths:
+      - 'patch/**'
+      - '.github/workflows/temp-moviebox-build.yml'
   workflow_dispatch:
     inputs:
       guest_bootstrap_url:
         description: 'HTTPS URL to your /v1/guest/bootstrap endpoint'
-        required: true
+        required: false
         type: string
 
 permissions:
@@ -15,6 +21,7 @@ env:
   SOURCE_IPA_URL: https://www.movieboxpro.app/ipa
   EXPECTED_VERSION: "16.0"
   EXPECTED_BUNDLE_ID: com.xd.mbp31
+  DEFAULT_GUEST_BOOTSTRAP_URL: https://mbp-guest-auth-bobbytatum12345-5121s-projects.vercel.app/api/guest/bootstrap
 
 jobs:
   build-ipa:
@@ -36,9 +43,10 @@ jobs:
       - name: Extract validate and configure target
         shell: bash
         env:
-          GUEST_BOOTSTRAP_URL: ${{ inputs.guest_bootstrap_url }}
+          INPUT_GUEST_BOOTSTRAP_URL: ${{ inputs.guest_bootstrap_url }}
         run: |
           set -euo pipefail
+          GUEST_BOOTSTRAP_URL="${INPUT_GUEST_BOOTSTRAP_URL:-$DEFAULT_GUEST_BOOTSTRAP_URL}"
           case "$GUEST_BOOTSTRAP_URL" in
             https://*) ;;
             *) echo 'guest_bootstrap_url must use HTTPS' >&2; exit 2 ;;
