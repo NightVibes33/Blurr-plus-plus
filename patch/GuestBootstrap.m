@@ -18,6 +18,7 @@ static NSInteger const kOverlayTag = 0x4D425047;
 
 static const void *kOrigAppFirstLoadKey = &kOrigAppFirstLoadKey;
 static const void *kGuestMarkerKey = &kGuestMarkerKey;
+static const void *kCodeHookKey = &kCodeHookKey;
 
 typedef NS_ENUM(NSInteger, GuestState) {
     GuestStateIdle = 0,
@@ -156,7 +157,7 @@ static BOOL InjectGuestIntoManager(id manager) {
 
     id existing = object_getIvar(manager, userIvar);
     if (existing && !objc_getAssociatedObject(existing, kGuestMarkerKey)) {
-        return YES; // Never overwrite a legitimate MovieBox user.
+        return YES;
     }
 
     NSString *username = KeychainRead(kGuestUsernameAccount);
@@ -203,7 +204,7 @@ static UIViewController *VisibleController(UIViewController *vc) {
     if ([vc isKindOfClass:UITabBarController.class]) {
         return VisibleController(((UITabBarController *)vc).selectedViewController ?: vc);
     }
-    for (UIViewController *child in [vc childViewControllers].reverseObjectEnumerator) {
+    for (UIViewController *child in [[vc childViewControllers] reverseObjectEnumerator]) {
         if (child.viewIfLoaded.window) {
             UIViewController *found = VisibleController(child);
             if (found) return found;
@@ -407,7 +408,7 @@ static void RefreshOwnedGuest(void) {
 }
 
 static void EnsureOwnedGuest(void) {
-    if (gState == GuestStateBootstrapping || gState == GuestStateTerminalFailure) return;
+    if (gState == GuestStateBootstrapping) return;
 
     if (HasCachedGuest()) {
         gState = GuestStateReady;
@@ -430,13 +431,66 @@ static void EnsureOwnedGuest(void) {
                 UIViewController *visibleLogin = gLoginController;
                 if (visibleLogin) {
                     ShowGuestStatus(visibleLogin,
-                        [NSString stringWithFormat:@"Guest backend setup failed:\n%@", errorMessage ?: @"unknown error"], YES);
+                        [NSString stringWithFormat:@"Guest backend setup failed:\n%@\n\nClose and reopen the app to retry.", errorMessage ?: @"unknown error"], YES);
                 }
                 return;
             }
             PersistGuestResponse(json);
         });
     });
+}
+
+static void GuestCodeLoginTapped(id self, SEL _cmd, id sender) {
+    (void)_cmd;
+    (void)sender;
+    if ([self isKindOfClass:UIViewController.class]) {
+        gLoginController = (UIViewController *)self;
+    }
+    if (gState == GuestStateTerminalFailure) gState = GuestStateIdle;
+    EnsureOwnedGuest();
+}
+
+static BOOL HookCodeButtonOnClass(Class cls) {
+    if (!cls) return NO;
+    if (objc_getAssociatedObject((id)cls, kCodeHookKey)) return YES;
+
+    SEL selector = NSSelectorFromString(@"codeLoginButtonTapped:");
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method) return NO;
+
+    method_setImplementation(method, (IMP)GuestCodeLoginTapped);
+    objc_setAssociatedObject((id)cls, kCodeHookKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return YES;
+}
+
+static void HookCodeLoginClasses(void) {
+    NSArray<NSString *> *names = @[
+        @"GoogleAdsSDK.MBInvitationCodeLoginController",
+        @"_TtC12GoogleAdsSDK31MBInvitationCodeLoginController",
+        @"MBInvitationCodeLoginController",
+        @"GoogleAdsSDK.MBLoginBaseViewController",
+        @"MBLoginBaseViewController",
+        @"GoogleAdsSDK.MBCodeLoginViewController",
+        @"MBCodeLoginViewController"
+    ];
+    for (NSString *name in names) {
+        Class cls = NSClassFromString(name);
+        if (!cls) cls = objc_getClass(name.UTF8String);
+        HookCodeButtonOnClass(cls);
+    }
+
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return;
+    Class *classes = (__unsafe_unretained Class *)calloc((size_t)count, sizeof(Class));
+    if (!classes) return;
+    count = objc_getClassList(classes, count);
+    for (int i = 0; i < count; i++) {
+        Class cls = classes[i];
+        NSString *name = NSStringFromClass(cls);
+        if (![name containsString:@"Login"] && ![name containsString:@"Invitation"]) continue;
+        HookCodeButtonOnClass(cls);
+    }
+    free(classes);
 }
 
 static void UserManagerAppFirstLoad(id self, SEL _cmd) {
@@ -471,7 +525,9 @@ static BOOL HookUserManager(void) {
 
 static void WatchdogTick(void) {
     if (gWatchdogTicks++ >= 120) return;
+
     HookUserManager();
+    HookCodeLoginClasses();
     ResolveUserManager();
 
     UIWindow *window = KeyWindow();
@@ -479,19 +535,15 @@ static void WatchdogTick(void) {
     if (visible && IsLoginController(visible)) {
         gLoginController = visible;
 
-        if (gState == GuestStateTerminalFailure) {
-            return; // Terminal means terminal: no retry/spam loop.
+        if (HasCachedGuest() && !gDidRouteOnce) {
+            if (gState != GuestStateReady) {
+                ShowGuestStatus(visible, @"Restoring your persistent guest account…", NO);
+            }
+            EnsureOwnedGuest();
         }
-
-        if (HasCachedGuest()) {
-            if (gState != GuestStateReady) ShowGuestStatus(visible, @"Restoring your persistent guest account…", NO);
-        } else if (gState == GuestStateIdle) {
-            ShowGuestStatus(visible, @"Creating your persistent guest account…", NO);
-        }
-        EnsureOwnedGuest();
     }
 
-    if (gState != GuestStateTerminalFailure && (!gDidRouteOnce || (visible && IsLoginController(visible)))) {
+    if (!gDidRouteOnce) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.50 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             WatchdogTick();
         });
@@ -502,6 +554,7 @@ __attribute__((constructor)) static void GuestBootstrapInit(void) {
     @autoreleasepool {
         StableInstallID();
         HookUserManager();
+        HookCodeLoginClasses();
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             WatchdogTick();
         });
