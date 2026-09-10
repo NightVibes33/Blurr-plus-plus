@@ -1,4 +1,4 @@
-name: Temp MovieBoxPro Owned Guest Backend Build
+name: Temp MovieBoxPro Guest Network Diagnostic Build
 
 on:
   push:
@@ -53,7 +53,7 @@ jobs:
           echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
           echo "EXECUTABLE=$EXECUTABLE" >> "$GITHUB_ENV"
 
-      - name: Build owned guest backend client
+      - name: Build guest client with network diagnostics
         shell: bash
         run: |
           set -euo pipefail
@@ -68,17 +68,20 @@ jobs:
             -dynamiclib \
             -fobjc-arc \
             work/build/GuestBootstrap.native.m \
+            patch/NetworkDiagnostics.m \
             -framework Foundation \
             -framework UIKit \
             -framework Security \
+            -framework QuartzCore \
             '-Wl,-install_name,@executable_path/Frameworks/MBPGuestBootstrap.dylib' \
             -o work/build/MBPGuestBootstrap.dylib
           file work/build/MBPGuestBootstrap.dylib
           test -s work/build/MBPGuestBootstrap.dylib
           strings work/build/MBPGuestBootstrap.dylib | grep -F 'movieboxpro-guest-auth.lovable.app/api/public/guest/bootstrap'
           strings work/build/MBPGuestBootstrap.dylib | grep -F 'didCompleteLogin'
+          strings work/build/MBPGuestBootstrap.dylib | grep -F 'NET DIAGNOSTIC'
 
-      - name: Inject owned guest backend client
+      - name: Inject guest client and diagnostics
         shell: bash
         run: |
           set -euo pipefail
@@ -93,17 +96,17 @@ jobs:
         run: |
           set -euo pipefail
           cd work/unpacked
-          ditto -c -k --sequesterRsrc --keepParent Payload ../../out/MovieBoxPro_16.0-owned-guest-native-login.ipa
+          ditto -c -k --sequesterRsrc --keepParent Payload ../../out/MovieBoxPro_16.0-guest-network-diagnostic-v12.ipa
           cd ../..
-          unzip -tq out/MovieBoxPro_16.0-owned-guest-native-login.ipa
-          shasum -a 256 out/MovieBoxPro_16.0-owned-guest-native-login.ipa | tee out/SHA256.txt
+          unzip -tq out/MovieBoxPro_16.0-guest-network-diagnostic-v12.ipa
+          shasum -a 256 out/MovieBoxPro_16.0-guest-network-diagnostic-v12.ipa | tee out/SHA256.txt
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MovieBoxPro-16.0-owned-guest-native-login
+          name: MovieBoxPro-16.0-guest-network-diagnostic-v12
           path: |
-            out/MovieBoxPro_16.0-owned-guest-native-login.ipa
+            out/MovieBoxPro_16.0-guest-network-diagnostic-v12.ipa
             out/SHA256.txt
           if-no-files-found: error
           compression-level: 0
