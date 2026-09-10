@@ -1,0 +1,40 @@
+name: Temp Guest Auth Persistence Test
+
+on:
+  push:
+    branches:
+      - temp/moviebox-persistent-session
+    paths:
+      - 'backend/**'
+      - '.github/workflows/temp-guest-auth-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-guest-auth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout temp branch
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Syntax check
+        run: npm run check
+
+      - name: Verify persistent guest identity and refresh
+        run: npm test
