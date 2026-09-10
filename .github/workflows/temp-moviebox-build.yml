@@ -59,13 +59,15 @@ jobs:
           set -euo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           mkdir -p work/build
+          python3 patch/apply_native_post_login.py patch/GuestBootstrap.m work/build/GuestBootstrap.native.m
+          grep -F 'didCompleteLogin' work/build/GuestBootstrap.native.m
           xcrun --sdk iphoneos clang \
             -arch arm64 \
             -isysroot "$SDK" \
             -miphoneos-version-min=15.0 \
             -dynamiclib \
             -fobjc-arc \
-            patch/GuestBootstrap.m \
+            work/build/GuestBootstrap.native.m \
             -framework Foundation \
             -framework UIKit \
             -framework Security \
@@ -74,6 +76,7 @@ jobs:
           file work/build/MBPGuestBootstrap.dylib
           test -s work/build/MBPGuestBootstrap.dylib
           strings work/build/MBPGuestBootstrap.dylib | grep -F 'movieboxpro-guest-auth.lovable.app/api/public/guest/bootstrap'
+          strings work/build/MBPGuestBootstrap.dylib | grep -F 'didCompleteLogin'
 
       - name: Inject owned guest backend client
         shell: bash
@@ -90,17 +93,17 @@ jobs:
         run: |
           set -euo pipefail
           cd work/unpacked
-          ditto -c -k --sequesterRsrc --keepParent Payload ../../out/MovieBoxPro_16.0-owned-guest-backend.ipa
+          ditto -c -k --sequesterRsrc --keepParent Payload ../../out/MovieBoxPro_16.0-owned-guest-native-login.ipa
           cd ../..
-          unzip -tq out/MovieBoxPro_16.0-owned-guest-backend.ipa
-          shasum -a 256 out/MovieBoxPro_16.0-owned-guest-backend.ipa | tee out/SHA256.txt
+          unzip -tq out/MovieBoxPro_16.0-owned-guest-native-login.ipa
+          shasum -a 256 out/MovieBoxPro_16.0-owned-guest-native-login.ipa | tee out/SHA256.txt
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MovieBoxPro-16.0-owned-guest-backend
+          name: MovieBoxPro-16.0-owned-guest-native-login
           path: |
-            out/MovieBoxPro_16.0-owned-guest-backend.ipa
+            out/MovieBoxPro_16.0-owned-guest-native-login.ipa
             out/SHA256.txt
           if-no-files-found: error
           compression-level: 0
