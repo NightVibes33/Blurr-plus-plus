@@ -3,6 +3,7 @@
 #import <Security/Security.h>
 #import <dispatch/dispatch.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 static NSString *const kService = @"com.xd.mbp31.persistent-guest";
 static NSString *const kInstallAccount = @"install-id";
@@ -12,10 +13,11 @@ static NSString *const kRefreshAccount = @"firebase-refresh-token";
 static NSString *const kUserChangedNotification = @"MBUserStatusChangedNotification";
 static NSInteger const kOverlayTag = 0x4D425047;
 
-static const void *kOrigDidAppearKey = &kOrigDidAppearKey;
 static const void *kOrigAppFirstLoadKey = &kOrigAppFirstLoadKey;
 static const void *kGuestMarkerKey = &kGuestMarkerKey;
 static BOOL gBootstrapStarted = NO;
+static BOOL gBootstrapFinished = NO;
+static NSInteger gWatchdogTicks = 0;
 static __weak id gUserManager = nil;
 static __weak UIViewController *gLoginController = nil;
 
@@ -80,10 +82,14 @@ static Class FindClass(NSArray<NSString *> *names) {
 static BOOL IsLoginController(id object) {
     if (!object) return NO;
     NSString *name = NSStringFromClass([object class]);
+    if (!name.length) return NO;
     return [name containsString:@"MBLoginBaseViewController"] ||
            [name containsString:@"MBCodeLoginViewController"] ||
            [name containsString:@"MBInvitationCodeLoginController"] ||
-           [name containsString:@"TVCodeLoginController"];
+           [name containsString:@"MBInputInvitationController"] ||
+           [name containsString:@"TVCodeLoginController"] ||
+           ([name containsString:@"GoogleAdsSDK"] &&
+            ([name containsString:@"Login"] || [name containsString:@"Invitation"]));
 }
 
 static BOOL HasCachedGuest(void) {
@@ -115,11 +121,7 @@ static id CreateGuestUser(NSString *guestID) {
         @"_TtC12GoogleAdsSDK6MBUser",
         @"MBUser"
     ]);
-    if (!userClass) {
-        NSLog(@"[MBPGuestBootstrap] MBUser class not found");
-        return nil;
-    }
-
+    if (!userClass) return nil;
     id user = [[userClass alloc] init];
     if (!user) return nil;
 
@@ -150,91 +152,79 @@ static BOOL ManagerAlreadyHasUser(id manager) {
 static BOOL InjectGuestIntoManager(id manager) {
     NSString *guestID = KeychainRead(kGuestUserAccount);
     if (!manager || !guestID.length) return NO;
-
     Ivar userIvar = UserIvarForManager(manager);
-    if (!userIvar) {
-        NSLog(@"[MBPGuestBootstrap] MBUserManager.user ivar not found");
-        return NO;
-    }
+    if (!userIvar) return NO;
 
     id existing = object_getIvar(manager, userIvar);
-    if (existing && !objc_getAssociatedObject(existing, kGuestMarkerKey)) {
-        return YES; // Preserve a legitimate MovieBox user.
-    }
+    if (existing && !objc_getAssociatedObject(existing, kGuestMarkerKey)) return YES;
 
     id guest = existing ?: CreateGuestUser(guestID);
     if (!guest) return NO;
     if (!existing) object_setIvar(manager, userIvar, guest);
-
     [[NSUserDefaults standardUserDefaults] setObject:guestID forKey:@"MBPGuestUserID"];
     [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"MBPGuestBootstrapComplete"];
-    NSLog(@"[MBPGuestBootstrap] active Firebase guest %@", guestID);
     return YES;
 }
 
-static UIWindow *WindowForController(UIViewController *vc) {
-    UIWindow *window = vc.viewIfLoaded.window;
-    if (window) return window;
-    window = vc.navigationController.viewIfLoaded.window;
-    if (window) return window;
-    window = vc.presentingViewController.viewIfLoaded.window;
-    if (window) return window;
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (![scene isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *candidate in ((UIWindowScene *)scene).windows) {
-            if (candidate.isKeyWindow) return candidate;
-            if (!window && candidate.rootViewController) window = candidate;
-        }
-    }
-    return window;
-}
-
-static UIViewController *CreateMainController(void) {
+static id ResolveUserManager(void) {
+    if (gUserManager) return gUserManager;
     Class cls = FindClass(@[
-        @"GoogleAdsSDK.MBTabBarController",
-        @"_TtC12GoogleAdsSDK18MBTabBarController",
-        @"MBTabBarController"
+        @"GoogleAdsSDK.MBUserManager",
+        @"_TtC12GoogleAdsSDK13MBUserManager",
+        @"MBUserManager"
     ]);
     if (!cls) return nil;
-    id object = [[cls alloc] init];
-    return [object isKindOfClass:UIViewController.class] ? object : nil;
+    NSArray<NSString *> *selectors = @[@"shared", @"sharedManager", @"sharedInstance", @"defaultManager"];
+    for (NSString *name in selectors) {
+        SEL sel = NSSelectorFromString(name);
+        if ([(id)cls respondsToSelector:sel]) {
+            id value = ((id (*)(id, SEL))objc_msgSend)((id)cls, sel);
+            if (value) {
+                gUserManager = value;
+                return value;
+            }
+        }
+    }
+    return nil;
 }
 
-static void RoutePastLogin(UIViewController *loginVC) {
-    if (!loginVC || !HasCachedGuest()) return;
-    if (gUserManager) InjectGuestIntoManager(gUserManager);
+static UIViewController *VisibleController(UIViewController *vc) {
+    if (!vc) return nil;
+    if (vc.presentedViewController && !vc.presentedViewController.isBeingDismissed) {
+        return VisibleController(vc.presentedViewController);
+    }
+    if ([vc isKindOfClass:UINavigationController.class]) {
+        return VisibleController(((UINavigationController *)vc).topViewController ?: vc);
+    }
+    if ([vc isKindOfClass:UITabBarController.class]) {
+        return VisibleController(((UITabBarController *)vc).selectedViewController ?: vc);
+    }
+    for (UIViewController *child in vc.children.reverseObjectEnumerator) {
+        if (child.viewIfLoaded.window) {
+            UIViewController *found = VisibleController(child);
+            if (found) return found;
+        }
+    }
+    return vc;
+}
 
-    [[NSNotificationCenter defaultCenter] postNotificationName:kUserChangedNotification
-                                                        object:nil
-                                                      userInfo:@{ @"guest": @YES,
-                                                                  @"user_id": KeychainRead(kGuestUserAccount) ?: @"" }];
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (!loginVC.viewIfLoaded.window) return;
-        if (loginVC.presentingViewController) {
-            [loginVC.presentingViewController dismissViewControllerAnimated:NO completion:nil];
-            return;
+static UIWindow *KeyWindow(void) {
+    UIWindow *fallback = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class]) continue;
+        if (scene.activationState == UISceneActivationStateUnattached) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window.isKeyWindow) return window;
+            if (!fallback && window.rootViewController) fallback = window;
         }
-        UINavigationController *nav = loginVC.navigationController;
-        if (nav && nav.topViewController == loginVC && nav.viewControllers.count > 1) {
-            [nav popViewControllerAnimated:NO];
-            return;
-        }
-        UIWindow *window = WindowForController(loginVC);
-        UIViewController *main = CreateMainController();
-        if (window && main) {
-            [UIView performWithoutAnimation:^{
-                window.rootViewController = main;
-                [window makeKeyAndVisible];
-                [window layoutIfNeeded];
-            }];
-        }
-    });
+    }
+    return fallback;
 }
 
 static void ShowGuestStatus(UIViewController *vc, NSString *message, BOOL failed) {
-    if (!vc || !vc.view) return;
+    if (!vc || !message.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (!vc.view) return;
         UIView *old = [vc.view viewWithTag:kOverlayTag];
         [old removeFromSuperview];
 
@@ -269,6 +259,7 @@ static void ShowGuestStatus(UIViewController *vc, NSString *message, BOOL failed
 
         [NSLayoutConstraint activateConstraints:constraints];
         [vc.view addSubview:cover];
+        [vc.view bringSubviewToFront:cover];
     });
 }
 
@@ -281,17 +272,64 @@ static NSString *FirebaseErrorMessage(NSData *data) {
     return message.length ? message : @"Firebase rejected the guest request";
 }
 
+static UIViewController *CreateMainController(void) {
+    Class cls = FindClass(@[
+        @"GoogleAdsSDK.MBTabBarController",
+        @"_TtC12GoogleAdsSDK18MBTabBarController",
+        @"MBTabBarController"
+    ]);
+    if (!cls) return nil;
+    id object = [[cls alloc] init];
+    return [object isKindOfClass:UIViewController.class] ? object : nil;
+}
+
+static void RoutePastLogin(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *login = gLoginController;
+        if (!login || !HasCachedGuest()) return;
+        id manager = ResolveUserManager();
+        if (manager && !InjectGuestIntoManager(manager)) {
+            ShowGuestStatus(login, @"Guest identity was created, but MovieBox could not attach it to MBUserManager.", YES);
+            return;
+        }
+
+        [[NSNotificationCenter defaultCenter] postNotificationName:kUserChangedNotification
+                                                            object:nil
+                                                          userInfo:@{ @"guest": @YES,
+                                                                      @"user_id": KeychainRead(kGuestUserAccount) ?: @"" }];
+
+        if (login.presentingViewController) {
+            [login.presentingViewController dismissViewControllerAnimated:NO completion:nil];
+            return;
+        }
+        UINavigationController *nav = login.navigationController;
+        if (nav && nav.topViewController == login && nav.viewControllers.count > 1) {
+            [nav popViewControllerAnimated:NO];
+            return;
+        }
+        UIWindow *window = login.viewIfLoaded.window ?: KeyWindow();
+        UIViewController *main = CreateMainController();
+        if (!window || !main) {
+            ShowGuestStatus(login, @"Guest identity is ready, but the main MovieBox controller could not be created.", YES);
+            return;
+        }
+        [UIView performWithoutAnimation:^{
+            window.rootViewController = main;
+            [window makeKeyAndVisible];
+            [window layoutIfNeeded];
+        }];
+    });
+}
+
 static void PersistFirebaseGuest(NSString *guestID, NSString *idToken, NSString *refreshToken) {
     if (!guestID.length || !idToken.length || !refreshToken.length) return;
     KeychainWrite(kGuestUserAccount, guestID);
     KeychainWrite(kAccessAccount, idToken);
     KeychainWrite(kRefreshAccount, refreshToken);
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (gUserManager) InjectGuestIntoManager(gUserManager);
-        UIViewController *login = gLoginController;
-        if (login) RoutePastLogin(login);
-    });
+    gBootstrapFinished = YES;
+    id manager = ResolveUserManager();
+    if (manager) InjectGuestIntoManager(manager);
+    RoutePastLogin();
 }
 
 static void FirebaseAnonymousSignUp(NSString *apiKey) {
@@ -306,10 +344,11 @@ static void FirebaseAnonymousSignUp(NSString *apiKey) {
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
         if (error || ![http isKindOfClass:NSHTTPURLResponse.class] || http.statusCode < 200 || http.statusCode >= 300) {
             NSString *reason = error.localizedDescription ?: FirebaseErrorMessage(data);
-            NSLog(@"[MBPGuestBootstrap] Firebase anonymous sign-up failed: %@", reason);
-            UIViewController *login = gLoginController;
-            if (login) ShowGuestStatus(login,
-                [NSString stringWithFormat:@"Guest account setup failed: %@\n\nThe 8-digit code is a device-pairing code and is not the Gmail/invitation code.", reason], YES);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIViewController *login = gLoginController;
+                if (login) ShowGuestStatus(login,
+                    [NSString stringWithFormat:@"Guest account setup failed:\n%@\n\nNo code is required. The 8-digit MovieBox code is only for device pairing.", reason], YES);
+            });
             gBootstrapStarted = NO;
             return;
         }
@@ -319,8 +358,10 @@ static void FirebaseAnonymousSignUp(NSString *apiKey) {
         NSString *idToken = [json[@"idToken"] isKindOfClass:NSString.class] ? json[@"idToken"] : nil;
         NSString *refresh = [json[@"refreshToken"] isKindOfClass:NSString.class] ? json[@"refreshToken"] : nil;
         if (!guestID.length || !idToken.length || !refresh.length) {
-            UIViewController *login = gLoginController;
-            if (login) ShowGuestStatus(login, @"Guest account setup failed: Firebase returned an incomplete session.", YES);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIViewController *login = gLoginController;
+                if (login) ShowGuestStatus(login, @"Guest account setup failed: Firebase returned an incomplete session.", YES);
+            });
             gBootstrapStarted = NO;
             return;
         }
@@ -345,7 +386,11 @@ static void FirebaseRefresh(NSString *apiKey, NSString *refreshToken) {
     [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
         if (error || ![http isKindOfClass:NSHTTPURLResponse.class] || http.statusCode < 200 || http.statusCode >= 300) {
-            NSLog(@"[MBPGuestBootstrap] Firebase refresh failed: %@", error.localizedDescription ?: FirebaseErrorMessage(data));
+            NSString *reason = error.localizedDescription ?: FirebaseErrorMessage(data);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIViewController *login = gLoginController;
+                if (login) ShowGuestStatus(login, [NSString stringWithFormat:@"Saved guest session could not refresh:\n%@", reason], YES);
+            });
             gBootstrapStarted = NO;
             return;
         }
@@ -359,14 +404,14 @@ static void FirebaseRefresh(NSString *apiKey, NSString *refreshToken) {
 }
 
 static void EnsureFirebaseGuest(void) {
-    if (gBootstrapStarted) return;
+    if (gBootstrapStarted || gBootstrapFinished) return;
     gBootstrapStarted = YES;
     StableInstallID();
 
     NSString *apiKey = FirebaseAPIKey();
     if (!apiKey.length) {
         UIViewController *login = gLoginController;
-        if (login) ShowGuestStatus(login, @"Guest account setup failed: Firebase API key is missing from GoogleService-Info.plist.", YES);
+        if (login) ShowGuestStatus(login, @"Guest account setup failed: GoogleService-Info.plist has no Firebase API key.", YES);
         gBootstrapStarted = NO;
         return;
     }
@@ -374,42 +419,20 @@ static void EnsureFirebaseGuest(void) {
     NSString *guestID = KeychainRead(kGuestUserAccount);
     NSString *refresh = KeychainRead(kRefreshAccount);
     if (guestID.length) {
-        if (gUserManager) InjectGuestIntoManager(gUserManager);
-        UIViewController *login = gLoginController;
-        if (login) RoutePastLogin(login);
+        id manager = ResolveUserManager();
+        if (manager) InjectGuestIntoManager(manager);
         if (refresh.length) FirebaseRefresh(apiKey, refresh);
-        else gBootstrapStarted = NO;
+        else {
+            UIViewController *login = gLoginController;
+            if (login) ShowGuestStatus(login, @"Saved guest identity exists but its refresh token is missing.", YES);
+            gBootstrapStarted = NO;
+        }
         return;
     }
 
     UIViewController *login = gLoginController;
     if (login) ShowGuestStatus(login, @"Creating your persistent guest account…", NO);
     FirebaseAnonymousSignUp(apiKey);
-}
-
-static NSValue *OriginalDidAppearValue(Class cls) {
-    for (Class current = cls; current != Nil; current = class_getSuperclass(current)) {
-        NSValue *value = objc_getAssociatedObject((id)current, kOrigDidAppearKey);
-        if (value) return value;
-    }
-    return nil;
-}
-
-static void LoginDidAppear(id self, SEL _cmd, BOOL animated) {
-    NSValue *stored = OriginalDidAppearValue([self class]);
-    IMP original = stored ? [stored pointerValue] : NULL;
-    if (original && original != (IMP)LoginDidAppear) {
-        ((void (*)(id, SEL, BOOL))original)(self, _cmd, animated);
-    }
-    if (![self isKindOfClass:UIViewController.class] || !IsLoginController(self)) return;
-    gLoginController = (UIViewController *)self;
-    if (HasCachedGuest()) {
-        if (gUserManager) InjectGuestIntoManager(gUserManager);
-        RoutePastLogin((UIViewController *)self);
-    } else {
-        ShowGuestStatus((UIViewController *)self, @"Creating your persistent guest account…", NO);
-    }
-    EnsureFirebaseGuest();
 }
 
 static void UserManagerAppFirstLoad(id self, SEL _cmd) {
@@ -420,26 +443,6 @@ static void UserManagerAppFirstLoad(id self, SEL _cmd) {
     }
     gUserManager = self;
     if (!ManagerAlreadyHasUser(self) && HasCachedGuest()) InjectGuestIntoManager(self);
-    EnsureFirebaseGuest();
-}
-
-static BOOL HookLoginClass(Class cls) {
-    if (!cls) return NO;
-    if (objc_getAssociatedObject((id)cls, kOrigDidAppearKey)) return YES;
-    Method inherited = class_getInstanceMethod(cls, @selector(viewDidAppear:));
-    if (!inherited) return NO;
-    IMP original = method_getImplementation(inherited);
-    const char *types = method_getTypeEncoding(inherited);
-    if (!original || !types) return NO;
-
-    if (!class_addMethod(cls, @selector(viewDidAppear:), (IMP)LoginDidAppear, types)) {
-        Method own = class_getInstanceMethod(cls, @selector(viewDidAppear:));
-        if (!own) return NO;
-        original = method_getImplementation(own);
-        if (original != (IMP)LoginDidAppear) method_setImplementation(own, (IMP)LoginDidAppear);
-    }
-    objc_setAssociatedObject((id)cls, kOrigDidAppearKey, [NSValue valueWithPointer:original], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    return YES;
 }
 
 static BOOL HookUserManager(void) {
@@ -450,7 +453,6 @@ static BOOL HookUserManager(void) {
     ]);
     if (!cls) return NO;
     if (objc_getAssociatedObject((id)cls, kOrigAppFirstLoadKey)) return YES;
-
     SEL selector = NSSelectorFromString(@"appFirstLoad");
     Method method = class_getInstanceMethod(cls, selector);
     if (!method) return NO;
@@ -461,45 +463,36 @@ static BOOL HookUserManager(void) {
     return YES;
 }
 
-static BOOL HookLoginClasses(void) {
-    NSArray<NSArray<NSString *> *> *groups = @[
-        @[@"GoogleAdsSDK.MBLoginBaseViewController", @"_TtC12GoogleAdsSDK25MBLoginBaseViewController", @"MBLoginBaseViewController"],
-        @[@"GoogleAdsSDK.MBCodeLoginViewController", @"_TtC12GoogleAdsSDK25MBCodeLoginViewController", @"MBCodeLoginViewController"],
-        @[@"GoogleAdsSDK.MBInvitationCodeLoginController", @"_TtC12GoogleAdsSDK31MBInvitationCodeLoginController", @"MBInvitationCodeLoginController"],
-        @[@"GoogleAdsSDK.TVCodeLoginController", @"_TtC12GoogleAdsSDK21TVCodeLoginController", @"TVCodeLoginController"]
-    ];
-    BOOL found = NO;
-    for (NSArray<NSString *> *names in groups) {
-        Class cls = FindClass(names);
-        if (cls) found |= HookLoginClass(cls);
-    }
-    return found;
-}
+static void WatchdogTick(void) {
+    if (gWatchdogTicks++ >= 80) return;
+    HookUserManager();
+    ResolveUserManager();
 
-static void InstallHooks(void) {
-    BOOL managerReady = HookUserManager();
-    BOOL loginReady = HookLoginClasses();
-    if (managerReady && loginReady) return;
-
-    __block NSInteger attempts = 0;
-    __block void (^retry)(void) = nil;
-    retry = ^{
-        attempts++;
-        BOOL manager = HookUserManager();
-        BOOL login = HookLoginClasses();
-        if ((manager && login) || attempts >= 120) {
-            retry = nil;
-            return;
+    UIWindow *window = KeyWindow();
+    UIViewController *visible = VisibleController(window.rootViewController);
+    if (visible && IsLoginController(visible)) {
+        gLoginController = visible;
+        if (HasCachedGuest()) {
+            ShowGuestStatus(visible, @"Restoring your persistent guest account…", NO);
+        } else {
+            ShowGuestStatus(visible, @"Creating your persistent guest account…", NO);
         }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), retry);
-    };
-    dispatch_async(dispatch_get_main_queue(), retry);
+        EnsureFirebaseGuest();
+    }
+
+    if (!gBootstrapFinished || (visible && IsLoginController(visible))) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.50 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            WatchdogTick();
+        });
+    }
 }
 
 __attribute__((constructor)) static void GuestBootstrapInit(void) {
     @autoreleasepool {
         StableInstallID();
-        // Install synchronously so MBUserManager.appFirstLoad cannot beat the hook.
-        InstallHooks();
+        HookUserManager();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.75 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            WatchdogTick();
+        });
     }
 }
