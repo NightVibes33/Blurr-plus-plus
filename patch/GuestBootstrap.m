@@ -199,7 +199,7 @@ static UIViewController *VisibleController(UIViewController *vc) {
     if ([vc isKindOfClass:UITabBarController.class]) {
         return VisibleController(((UITabBarController *)vc).selectedViewController ?: vc);
     }
-    for (UIViewController *child in vc.children.reverseObjectEnumerator) {
+    for (UIViewController *child in [vc childViewControllers].reverseObjectEnumerator) {
         if (child.viewIfLoaded.window) {
             UIViewController *found = VisibleController(child);
             if (found) return found;
