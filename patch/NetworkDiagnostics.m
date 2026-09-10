@@ -4,9 +4,12 @@
 #import <objc/message.h>
 
 static const void *kNetOriginalResumeKey = &kNetOriginalResumeKey;
+static const void *kNetOriginalDataTaskKey = &kNetOriginalDataTaskKey;
 static NSInteger const kNetOverlayTag = 0x4D42504E;
 static NSMutableArray<NSString *> *gNetLines;
 static NSInteger gObservedRequests = 0;
+
+typedef void (^NetDataCompletion)(NSData *data, NSURLResponse *response, NSError *error);
 
 static UIWindow *NetKeyWindow(void) {
     UIWindow *fallback = nil;
@@ -21,12 +24,20 @@ static UIWindow *NetKeyWindow(void) {
     return fallback;
 }
 
+static NSString *NetTruncate(NSString *value, NSUInteger maxLength) {
+    if (!value.length) return @"-";
+    NSString *flat = [[value stringByReplacingOccurrencesOfString:@"\n" withString:@" "]
+                      stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
+    if (flat.length <= maxLength) return flat;
+    return [[flat substringToIndex:maxLength] stringByAppendingString:@"…"];
+}
+
 static void NetPublish(NSString *line) {
     if (!line.length) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (!gNetLines) gNetLines = [NSMutableArray array];
         [gNetLines addObject:line];
-        while (gNetLines.count > 4) [gNetLines removeObjectAtIndex:0];
+        while (gNetLines.count > 5) [gNetLines removeObjectAtIndex:0];
 
         UIWindow *window = NetKeyWindow();
         if (!window) return;
@@ -116,8 +127,7 @@ static BOOL RequestHasLegacyCredential(NSURLRequest *request) {
     return NO;
 }
 
-static NSString *TaskBrief(NSURLSessionTask *task) {
-    NSURLRequest *request = task.currentRequest ?: task.originalRequest;
+static NSString *RequestBrief(NSURLRequest *request) {
     if (!request) return @"request=?";
     NSString *host = request.URL.host ?: @"?";
     NSString *path = request.URL.path.length ? request.URL.path : @"/";
@@ -127,9 +137,65 @@ static NSString *TaskBrief(NSURLSessionTask *task) {
     return [NSString stringWithFormat:@"%@%@ %@", host, path, credential];
 }
 
+static NSString *TaskBrief(NSURLSessionTask *task) {
+    return RequestBrief(task.currentRequest ?: task.originalRequest);
+}
+
+static NSString *NetScalar(id value) {
+    if ([value isKindOfClass:NSString.class]) return NetTruncate((NSString *)value, 100);
+    if ([value isKindOfClass:NSNumber.class]) return [(NSNumber *)value stringValue];
+    if ([value isKindOfClass:NSNull.class]) return @"null";
+    return @"-";
+}
+
+static NSString *NetDataShape(id value) {
+    if (!value || value == NSNull.null) return @"null";
+    if ([value isKindOfClass:NSDictionary.class]) return [NSString stringWithFormat:@"dict(%lu)", (unsigned long)[(NSDictionary *)value count]];
+    if ([value isKindOfClass:NSArray.class]) return [NSString stringWithFormat:@"array(%lu)", (unsigned long)[(NSArray *)value count]];
+    if ([value isKindOfClass:NSString.class]) return [NSString stringWithFormat:@"string(%lu)", (unsigned long)[(NSString *)value length]];
+    if ([value isKindOfClass:NSNumber.class]) return @"number";
+    return NSStringFromClass([value class]) ?: @"?";
+}
+
+static NSString *ResponseEnvelopeSummary(NSData *data, NSURLResponse *response, NSError *error) {
+    NSInteger httpStatus = [response isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)response).statusCode : 0;
+    if (error) return [NSString stringWithFormat:@"BODY http=%ld transportErr=%ld", (long)httpStatus, (long)error.code];
+    if (!data.length) return [NSString stringWithFormat:@"BODY http=%ld empty", (long)httpStatus];
+
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![json isKindOfClass:NSDictionary.class]) {
+        return [NSString stringWithFormat:@"BODY http=%ld nonJSON bytes=%lu", (long)httpStatus, (unsigned long)data.length];
+    }
+
+    NSDictionary *dict = (NSDictionary *)json;
+    id code = dict[@"code"] ?: dict[@"status"] ?: dict[@"status_code"];
+    id message = dict[@"msg"] ?: dict[@"message"];
+    id errorObject = dict[@"error"];
+    if (!message && [errorObject isKindOfClass:NSDictionary.class]) {
+        message = ((NSDictionary *)errorObject)[@"message"] ?: ((NSDictionary *)errorObject)[@"msg"];
+    } else if (!message && [errorObject isKindOfClass:NSString.class]) {
+        message = errorObject;
+    }
+    id payload = dict[@"data"] ?: dict[@"result"];
+
+    return [NSString stringWithFormat:@"BODY http=%ld code=%@ msg=%@ data=%@",
+            (long)httpStatus,
+            NetScalar(code),
+            NetScalar(message),
+            NetDataShape(payload)];
+}
+
 static IMP OriginalResumeIMPForObject(id object) {
     for (Class cls = object_getClass(object); cls; cls = class_getSuperclass(cls)) {
         NSValue *value = objc_getAssociatedObject((id)cls, kNetOriginalResumeKey);
+        if (value) return [value pointerValue];
+    }
+    return NULL;
+}
+
+static IMP OriginalDataTaskIMPForObject(id object) {
+    for (Class cls = object_getClass(object); cls; cls = class_getSuperclass(cls)) {
+        NSValue *value = objc_getAssociatedObject((id)cls, kNetOriginalDataTaskKey);
         if (value) return [value pointerValue];
     }
     return NULL;
@@ -165,6 +231,22 @@ static void NetResume(id self, SEL _cmd) {
     }
 
     if (brief.length) ObserveCompletion(task, brief, 0);
+}
+
+static NSURLSessionDataTask *NetDataTaskWithRequestCompletion(id self, SEL _cmd, NSURLRequest *request, NetDataCompletion completion) {
+    IMP original = OriginalDataTaskIMPForObject(self);
+    if (!original || original == (IMP)NetDataTaskWithRequestCompletion) return nil;
+
+    if (!request || !IsInterestingRequest(request)) {
+        return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, NetDataCompletion))original)(self, _cmd, request, completion);
+    }
+
+    NSString *brief = RequestBrief(request);
+    NetDataCompletion wrapped = ^(NSData *data, NSURLResponse *response, NSError *error) {
+        NetPublish(ResponseEnvelopeSummary(data, response, error));
+        if (completion) completion(data, response, error);
+    };
+    return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, NetDataCompletion))original)(self, _cmd, request, wrapped);
 }
 
 static BOOL ClassDefinesSelector(Class cls, SEL selector, Method *outMethod) {
@@ -206,11 +288,41 @@ static void HookResumeMethods(void) {
     free(classes);
 }
 
+static void HookDataTaskMethods(void) {
+    SEL selector = NSSelectorFromString(@"dataTaskWithRequest:completionHandler:");
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return;
+    Class *classes = (__unsafe_unretained Class *)calloc((size_t)count, sizeof(Class));
+    if (!classes) return;
+    count = objc_getClassList(classes, count);
+
+    for (int i = 0; i < count; i++) {
+        Class cls = classes[i];
+        if (cls != NSURLSession.class && ![cls isSubclassOfClass:NSURLSession.class]) continue;
+        Method method = NULL;
+        if (!ClassDefinesSelector(cls, selector, &method) || !method) continue;
+        if (objc_getAssociatedObject((id)cls, kNetOriginalDataTaskKey)) continue;
+        IMP original = method_getImplementation(method);
+        if (!original || original == (IMP)NetDataTaskWithRequestCompletion) continue;
+        objc_setAssociatedObject((id)cls, kNetOriginalDataTaskKey, [NSValue valueWithPointer:original], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        method_setImplementation(method, (IMP)NetDataTaskWithRequestCompletion);
+    }
+    free(classes);
+}
+
+static void InstallNetworkDiagnostics(void) {
+    HookResumeMethods();
+    HookDataTaskMethods();
+}
+
 __attribute__((constructor)) static void NetworkDiagnosticsInit(void) {
     @autoreleasepool {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.50 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            HookResumeMethods();
-            NetPublish(@"observer active");
+            InstallNetworkDiagnostics();
+            NetPublish(@"observer active (HTTP + app envelope)");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                InstallNetworkDiagnostics();
+            });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 if (gObservedRequests == 0) NetPublish(@"NO HTTP(S) request observed after startup");
             });
