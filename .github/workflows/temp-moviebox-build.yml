@@ -1,4 +1,4 @@
-name: Temp MovieBoxPro Firebase Guest Build
+name: Temp MovieBoxPro Owned Guest Backend Build
 
 on:
   push:
@@ -50,16 +50,10 @@ jobs:
           test "$BUNDLE_ID" = "$EXPECTED_BUNDLE_ID"
           test "$SHORT_VERSION" = "$EXPECTED_VERSION"
           test -f "$APP_PATH/$EXECUTABLE"
-          test -f "$APP_PATH/GoogleService-Info.plist"
-          FIREBASE_API_KEY="$(/usr/libexec/PlistBuddy -c 'Print :API_KEY' "$APP_PATH/GoogleService-Info.plist")"
-          FIREBASE_PROJECT="$(/usr/libexec/PlistBuddy -c 'Print :PROJECT_ID' "$APP_PATH/GoogleService-Info.plist")"
-          test -n "$FIREBASE_API_KEY"
-          test -n "$FIREBASE_PROJECT"
           echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
           echo "EXECUTABLE=$EXECUTABLE" >> "$GITHUB_ENV"
-          echo "Firebase project: $FIREBASE_PROJECT"
 
-      - name: Build Firebase guest bootstrap client
+      - name: Build owned guest backend client
         shell: bash
         run: |
           set -euo pipefail
@@ -79,8 +73,9 @@ jobs:
             -o work/build/MBPGuestBootstrap.dylib
           file work/build/MBPGuestBootstrap.dylib
           test -s work/build/MBPGuestBootstrap.dylib
+          strings work/build/MBPGuestBootstrap.dylib | grep -F 'movieboxpro-guest-auth.lovable.app/api/public/guest/bootstrap'
 
-      - name: Inject Firebase guest client
+      - name: Inject owned guest backend client
         shell: bash
         run: |
           set -euo pipefail
@@ -95,17 +90,17 @@ jobs:
         run: |
           set -euo pipefail
           cd work/unpacked
-          ditto -c -k --sequesterRsrc --keepParent Payload ../../out/MovieBoxPro_16.0-firebase-guest.ipa
+          ditto -c -k --sequesterRsrc --keepParent Payload ../../out/MovieBoxPro_16.0-owned-guest-backend.ipa
           cd ../..
-          unzip -tq out/MovieBoxPro_16.0-firebase-guest.ipa
-          shasum -a 256 out/MovieBoxPro_16.0-firebase-guest.ipa | tee out/SHA256.txt
+          unzip -tq out/MovieBoxPro_16.0-owned-guest-backend.ipa
+          shasum -a 256 out/MovieBoxPro_16.0-owned-guest-backend.ipa | tee out/SHA256.txt
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MovieBoxPro-16.0-firebase-guest
+          name: MovieBoxPro-16.0-owned-guest-backend
           path: |
-            out/MovieBoxPro_16.0-firebase-guest.ipa
+            out/MovieBoxPro_16.0-owned-guest-backend.ipa
             out/SHA256.txt
           if-no-files-found: error
           compression-level: 0
