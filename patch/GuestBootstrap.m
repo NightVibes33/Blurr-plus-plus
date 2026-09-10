@@ -139,7 +139,7 @@ static UIView *MBPBootstrapCover(UIViewController *vc) {
 
     UILabel *label = [[UILabel alloc] init];
     label.translatesAutoresizingMaskIntoConstraints = NO;
-    label.text = @"Setting up your profile…";
+    label.text = @"Setting up your guest account…";
     label.textColor = UIColor.whiteColor;
     label.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
 
@@ -173,11 +173,11 @@ static void MBPShowBootstrapFailure(NSString *message) {
 
 static NSString *MBPSanitizedInstallID(void) {
     NSString *raw = [[MBPStableInstallID() stringByReplacingOccurrencesOfString:@"-" withString:@""] lowercaseString];
-    if (raw.length > 16) raw = [raw substringToIndex:16];
+    if (raw.length > 24) raw = [raw substringToIndex:24];
     return raw;
 }
 
-static void MBPAttemptNativeRegistration(UIViewController *loginVC) {
+static void MBPAttemptNativeThirdPartyLogin(UIViewController *loginVC) {
     if (gBootstrapStarted) return;
     gBootstrapStarted = YES;
     gLoginController = loginVC;
@@ -198,47 +198,52 @@ static void MBPAttemptNativeRegistration(UIViewController *loginVC) {
         @"_TtC12GoogleAdsSDK23MBAccountViewController",
         @"MBAccountViewController"
     ]);
-    SEL registerSel = NSSelectorFromString(@"thirdPartRegesterWithUsername:userInfo:invitationCode:");
-    if (!accountClass || !class_getInstanceMethod(accountClass, registerSel)) {
-        MBPShowBootstrapFailure(@"Automatic profile setup is unavailable in this build (registration selector not found).");
+    SEL loginSel = NSSelectorFromString(@"thirdPartLoginWithUserInfo:needUploadAvatar:");
+    if (!accountClass || !class_getInstanceMethod(accountClass, loginSel)) {
+        MBPShowBootstrapFailure(@"Guest account setup is unavailable in this build (Login_thirdpart selector not found).");
         return;
     }
 
     id controller = ((id (*)(id, SEL))objc_msgSend)((id)accountClass, @selector(alloc));
     controller = ((id (*)(id, SEL))objc_msgSend)(controller, @selector(init));
     if (!controller) {
-        MBPShowBootstrapFailure(@"Automatic profile setup could not initialize the account controller.");
+        MBPShowBootstrapFailure(@"Guest account setup could not initialize the account controller.");
         return;
     }
     gBootstrapController = controller;
 
+    NSString *openid = MBPStableInstallID();
     NSString *idPart = MBPSanitizedInstallID();
-    NSString *username = [@"guest" stringByAppendingString:[idPart substringToIndex:MIN((NSUInteger)12, idPart.length)]];
-    NSString *email = [NSString stringWithFormat:@"%@@example.com", username];
+    NSString *username = [@"guest" stringByAppendingString:idPart];
+    NSString *email = [NSString stringWithFormat:@"%@@guest.invalid", username];
 
-    /*
-     * MBAccountViewController's native registration code reads exactly these
-     * userInfo keys, generates its own six-character password, hard-codes the
-     * provider type to "google", and sends RegisterV3 through MovieBox's own
-     * HTTPS/encryption stack. We intentionally call that native path instead
-     * of recreating the protocol in this dylib.
-     */
+    /* Supply every spelling used by the client-side auth tuples.  The native
+       controller remains responsible for constructing and sending Login_thirdpart
+       and for persisting any returned MBUser/session_credential. */
     NSDictionary *userInfo = @{
-        @"email": email,
-        @"id_token": MBPStableInstallID(),
-        @"name": username
+        @"type": @"guest",
+        @"openid": openid,
+        @"openId": openid,
+        @"sub": openid,
+        @"uid": openid,
+        @"accesstoken": openid,
+        @"accessToken": openid,
+        @"id_token": openid,
+        @"name": username,
+        @"nick": username,
+        @"nickname": username,
+        @"email": email
     };
 
-    NSLog(@"[MBPGuestBootstrap] starting native RegisterV3 bootstrap for %@", username);
-    ((void (*)(id, SEL, NSString *, NSDictionary *, NSString *))objc_msgSend)(controller,
-                                                                              registerSel,
-                                                                              username,
-                                                                              userInfo,
-                                                                              @"");
+    NSLog(@"[MBPGuestBootstrap] starting native Login_thirdpart guest bootstrap for %@", username);
+    ((void (*)(id, SEL, NSDictionary *, BOOL))objc_msgSend)(controller,
+                                                            loginSel,
+                                                            userInfo,
+                                                            NO);
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!gInstalledMainRoot) {
-            MBPShowBootstrapFailure(@"Automatic profile setup did not produce a valid session. The server rejected or did not complete the native registration request.");
+            MBPShowBootstrapFailure(@"Guest Login_thirdpart did not produce a valid session. This server build does not appear to accept the guest identity type yet.");
         }
     });
 }
@@ -261,7 +266,7 @@ static void MBPLoginDidAppear(id self, SEL _cmd, BOOL animated) {
     if ([self isKindOfClass:UIViewController.class]) {
         UIViewController *vc = (UIViewController *)self;
         dispatch_async(dispatch_get_main_queue(), ^{
-            MBPAttemptNativeRegistration(vc);
+            MBPAttemptNativeThirdPartyLogin(vc);
         });
     }
 }
