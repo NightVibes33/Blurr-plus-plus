@@ -32,7 +32,7 @@ static void NetPublish(NSString *line) {
         if (!window) return;
         UILabel *label = (UILabel *)[window viewWithTag:kNetOverlayTag];
         if (![label isKindOfClass:UILabel.class]) {
-            label = [[UILabel alloc] initWithFrame:CGRectZero];
+            label = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 0, 0)];
             label.tag = kNetOverlayTag;
             label.translatesAutoresizingMaskIntoConstraints = NO;
             label.numberOfLines = 0;
