@@ -1,0 +1,14 @@
+{
+  "name": "mbp-guest-auth",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs",
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0"
+  }
+}
