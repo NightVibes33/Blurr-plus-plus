@@ -1,0 +1,57 @@
+name: Temp CapCut IPA Artifact
+
+on:
+  push:
+    branches:
+      - temp/capcut-cookie-seed-20260914
+    paths:
+      - '.github/workflows/temp-capcut-ipa-artifact.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  assemble-ipa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download transport pieces
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p stage
+          curl -L --fail --retry 3 'https://at.adobe.com/7Crzb2hayfZv3Zfe' -o stage/part-00
+          curl -L --fail --retry 3 'https://at.adobe.com/TvOhp3fu1SBShYSq' -o stage/part-01a.b64
+          curl -L --fail --retry 3 'https://at.adobe.com/x80dsW7cUDYfvqE3' -o stage/part-01b.b64
+          curl -L --fail --retry 3 'https://at.adobe.com/X6gef2OwMYBdP2rD' -o stage/part-02
+          curl -L --fail --retry 3 'https://at.adobe.com/1MB1bhZZSaChbvYC' -o stage/part-03
+          curl -L --fail --retry 3 'https://at.adobe.com/oi6PAJwfAOXrl3wo' -o stage/part-04
+          ls -lh stage
+
+      - name: Reassemble exact IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 --decode stage/part-01a.b64 > stage/part-01a
+          base64 --decode stage/part-01b.b64 > stage/part-01b
+          cat \
+            stage/part-00 \
+            stage/part-01a \
+            stage/part-01b \
+            stage/part-02 \
+            stage/part-03 \
+            stage/part-04 \
+            > CapCutPatched.ipa
+          echo 'e8192e87ce0234709725828cef4cbf21e2918e0fb7c77935933858267bc02ecc  CapCutPatched.ipa' | sha256sum -c -
+          unzip -tq CapCutPatched.ipa
+          ls -lh CapCutPatched.ipa
+
+      - name: Upload full IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CapCutPatched-IPA
+          path: CapCutPatched.ipa
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
