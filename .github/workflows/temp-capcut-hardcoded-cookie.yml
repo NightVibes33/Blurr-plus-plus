@@ -1,0 +1,177 @@
+name: Temp CapCut Hardcoded Cookie IPA
+
+on:
+  push:
+    branches:
+      - temp/capcut-cookie-seed-20260914
+    paths:
+      - '.github/workflows/temp-capcut-hardcoded-cookie.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-hardcoded-cookie-ipa:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Download existing patched IPA transport pieces
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p stage
+          curl -L --fail --retry 3 'https://at.adobe.com/7Crzb2hayfZv3Zfe' -o stage/part-00
+          curl -L --fail --retry 3 'https://at.adobe.com/TvOhp3fu1SBShYSq' -o stage/part-01a.b64
+          curl -L --fail --retry 3 'https://at.adobe.com/x80dsW7cUDYfvqE3' -o stage/part-01b.b64
+          curl -L --fail --retry 3 'https://at.adobe.com/X6gef2OwMYBdP2rD' -o stage/part-02
+          curl -L --fail --retry 3 'https://at.adobe.com/1MB1bhZZSaChbvYC' -o stage/part-03
+          curl -L --fail --retry 3 'https://at.adobe.com/oi6PAJwfAOXrl3wo' -o stage/part-04
+
+      - name: Reassemble and verify existing IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          from pathlib import Path
+          for name in ('part-01a','part-01b'):
+              src = Path('stage/' + name + '.b64')
+              Path('stage/' + name).write_bytes(base64.b64decode(src.read_bytes()))
+          PY
+          cat stage/part-00 stage/part-01a stage/part-01b stage/part-02 stage/part-03 stage/part-04 > CapCutPatched-base.ipa
+          echo 'e8192e87ce0234709725828cef4cbf21e2918e0fb7c77935933858267bc02ecc  CapCutPatched-base.ipa' | shasum -a 256 -c -
+          unzip -tq CapCutPatched-base.ipa
+
+      - name: Extract cookie and app
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf work
+          mkdir work
+          unzip -q CapCutPatched-base.ipa -d work
+          APP="work/Payload/CapCut.app"
+          test -f "$APP/CapCutSeedCookies.binarycookies"
+          test -f "$APP/Frameworks/CapCutCookieBootstrap.dylib"
+          shasum -a 256 "$APP/CapCutSeedCookies.binarycookies" | tee cookie-sha256.txt
+          wc -c "$APP/CapCutSeedCookies.binarycookies"
+
+      - name: Generate hardcoded cookie bootstrap source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          cookie = Path('work/Payload/CapCut.app/CapCutSeedCookies.binarycookies').read_bytes()
+          vals = ','.join(f'0x{b:02x}' for b in cookie)
+          src = r'''#import <Foundation/Foundation.h>
+          #import <UIKit/UIKit.h>
+
+          static const unsigned char kHardcodedCookieBytes[] = {__COOKIE_BYTES__};
+          static const NSUInteger kHardcodedCookieLength = sizeof(kHardcodedCookieBytes);
+
+          static void InstallHardcodedCookie(void) {
+              @autoreleasepool {
+                  NSString *cookiesDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Cookies"];
+                  NSString *target = [cookiesDir stringByAppendingPathComponent:@"Cookies.binarycookies"];
+                  NSFileManager *fm = [NSFileManager defaultManager];
+                  NSError *error = nil;
+
+                  if (![fm createDirectoryAtPath:cookiesDir
+                      withIntermediateDirectories:YES
+                                       attributes:nil
+                                            error:&error]) {
+                      return;
+                  }
+
+                  NSData *data = [NSData dataWithBytes:kHardcodedCookieBytes length:kHardcodedCookieLength];
+                  NSString *tmp = [target stringByAppendingString:@".hardcoded.tmp"];
+                  [fm removeItemAtPath:tmp error:nil];
+                  if (![data writeToFile:tmp options:NSDataWritingAtomic error:&error]) {
+                      return;
+                  }
+                  [fm removeItemAtPath:target error:nil];
+                  if (![fm moveItemAtPath:tmp toPath:target error:&error]) {
+                      [data writeToFile:target options:NSDataWritingAtomic error:nil];
+                  }
+              }
+          }
+
+          __attribute__((constructor))
+          static void CapCutHardcodedCookieBootstrap(void) {
+              InstallHardcodedCookie();
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  InstallHardcodedCookie();
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+                      InstallHardcodedCookie();
+                  });
+                  [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                                    object:nil
+                                                                     queue:[NSOperationQueue mainQueue]
+                                                                usingBlock:^(__unused NSNotification *note) {
+                      InstallHardcodedCookie();
+                  }];
+              });
+          }
+          '''.replace('__COOKIE_BYTES__', vals)
+          Path('HardcodedCookieBootstrap.m').write_text(src)
+          print('embedded cookie bytes:', len(cookie))
+          PY
+
+      - name: Compile hardcoded bootstrap dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -dynamiclib \
+            -fobjc-arc \
+            -fblocks \
+            HardcodedCookieBootstrap.m \
+            -framework Foundation \
+            -framework UIKit \
+            '-Wl,-install_name,@executable_path/Frameworks/CapCutCookieBootstrap.dylib' \
+            -o work/Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib
+          file work/Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib
+          otool -D work/Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib
+          strings work/Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib | grep -F 'Library/Cookies'
+          strings work/Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib | grep -F 'Cookies.binarycookies'
+
+      - name: Remove external seed and stale signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="work/Payload/CapCut.app"
+          rm -f "$APP/CapCutSeedCookies.binarycookies"
+          rm -rf "$APP/_CodeSignature"
+          rm -rf "$APP/Frameworks/CapCutCookieBootstrap.dylib.dSYM"
+          test ! -e "$APP/CapCutSeedCookies.binarycookies"
+
+      - name: Package and validate IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f CapCutPatched-HardcodedCookie.ipa
+          (cd work && zip -qry -1 "$GITHUB_WORKSPACE/CapCutPatched-HardcodedCookie.ipa" Payload)
+          unzip -tq CapCutPatched-HardcodedCookie.ipa
+          if unzip -l CapCutPatched-HardcodedCookie.ipa | grep -F 'CapCutSeedCookies.binarycookies'; then
+            echo 'External seed cookie unexpectedly remains in IPA' >&2
+            exit 1
+          fi
+          shasum -a 256 CapCutPatched-HardcodedCookie.ipa | tee IPA-SHA256.txt
+          ls -lh CapCutPatched-HardcodedCookie.ipa
+
+      - name: Upload full hardcoded-cookie IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CapCutPatched-HardcodedCookie-IPA
+          path: |
+            CapCutPatched-HardcodedCookie.ipa
+            IPA-SHA256.txt
+            cookie-sha256.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
