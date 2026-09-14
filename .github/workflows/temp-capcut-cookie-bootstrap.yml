@@ -1,0 +1,55 @@
+name: Temp CapCut Cookie Bootstrap
+
+on:
+  push:
+    branches:
+      - temp/capcut-cookie-seed-20260914
+    paths:
+      - 'patch/CapCutCookieBootstrap.m'
+      - '.github/workflows/temp-capcut-cookie-bootstrap.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-dylib:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build bootstrap dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          mkdir -p out
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -dynamiclib \
+            -fobjc-arc \
+            -fblocks \
+            patch/CapCutCookieBootstrap.m \
+            -framework Foundation \
+            -framework UIKit \
+            '-Wl,-install_name,@executable_path/Frameworks/CapCutCookieBootstrap.dylib' \
+            -o out/CapCutCookieBootstrap.dylib
+          file out/CapCutCookieBootstrap.dylib
+          otool -D out/CapCutCookieBootstrap.dylib
+          strings out/CapCutCookieBootstrap.dylib | grep -F 'CapCutSeedCookies.binarycookies'
+          shasum -a 256 out/CapCutCookieBootstrap.dylib | tee out/SHA256.txt
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: CapCutCookieBootstrap
+          path: |
+            out/CapCutCookieBootstrap.dylib
+            out/SHA256.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
