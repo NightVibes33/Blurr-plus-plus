@@ -1,4 +1,4 @@
-name: TTKillerPlus entitlement disassembly
+name: Build owner-local TTKillerPlus IPA
 
 on:
   push:
@@ -6,9 +6,9 @@ on:
     paths: [.github/workflows/ttkiller-inspect.yml]
 
 jobs:
-  inspect:
+  build:
     runs-on: macos-15
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - name: Fetch public IPA
         shell: bash
@@ -32,7 +32,6 @@ jobs:
           console.log('repo',resp?.status(),page.url(),await page.title());
           await page.waitForTimeout(5000);
           const link=page.locator(`a[href*="TikTok_46.8_TTKillerPlus_2.1.ipa"]`).first();
-          console.log('matching links',await link.count());
           let download;
           if (await link.count()) {
             [download]=await Promise.all([
@@ -45,7 +44,6 @@ jobs:
             try { await p2.goto(URL,{waitUntil:'commit',timeout:120000}); } catch(e) { console.log(String(e)); }
             download=await dp;
           }
-          console.log('download suggested',download.suggestedFilename());
           await download.saveAs(OUT);
           console.log('saved',fs.statSync(OUT).size);
           await browser.close();
@@ -54,45 +52,226 @@ jobs:
           cd ..
           unzip -tq TikTok.ipa >/dev/null
 
-      - name: Disassemble entitlement methods
+      - name: Extract IPA
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf work out && mkdir work out
+          rm -rf work build
+          mkdir work build
           ditto -x -k TikTok.ipa work
-          D="$(find work/Payload -path '*/Frameworks/TTKPlus.dylib' -type f | head -1)"
-          otool -l "$D" > out/load-commands.txt
-          otool -tvV "$D" > out/disasm-all.txt
-          python3 - <<'PY'
-          import re, pathlib
-          p=pathlib.Path('out/disasm-all.txt')
-          lines=p.read_text(errors='ignore').splitlines()
-          targets=[
-            ('authenticateUserWithEmail_licenseKey',0x48324,0x49fdc),
-            ('verifyLicenseWithEmail_licenseKey_deviceIdentifier',0x49fdc,0x4ade0),
-            ('checkAuthenticationStatus',0x4ade0,0x4b038),
-            ('saveAuthenticationState',0x4b038,0x4b924),
-            ('settingsTkVerify',0x4b924,0x4b958),
-            ('isValidEmail',0x4b958,0x4b9d8),
-            ('isValidLicenseKey',0x4b9d8,0x4ba4c),
-            ('setupActivationCell',0x526e8,0x52a00),
-          ]
-          addr_re=re.compile(r'^([0-9a-fA-F]{8,16})\s')
-          parsed=[]
-          for idx,line in enumerate(lines):
-              m=addr_re.match(line)
-              if m: parsed.append((int(m.group(1),16),idx))
-          for name,start,end in targets:
-              selected=[]
-              for addr,idx in parsed:
-                  if start <= addr < end:
-                      selected.append(lines[idx])
-              pathlib.Path(f'out/{name}.txt').write_text('\n'.join(selected)+'\n')
-          PY
-          rm out/disasm-all.txt
+          APP="$(find work/Payload -maxdepth 1 -type d -name '*.app' | head -1)"
+          test -n "$APP"
+          test -f "$APP/Frameworks/TTKPlus.dylib"
+          echo "APP=$APP" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - name: Build owner override
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/OwnerOverride.m <<'OBJC'
+          #import <Foundation/Foundation.h>
+          #import <UIKit/UIKit.h>
+          #import <objc/runtime.h>
+          #import <objc/message.h>
+          #import <dispatch/dispatch.h>
+
+          static NSString *OwnerEmail(void) {
+              return @"owner@local.invalid";
+          }
+
+          static NSString *OwnerKey(void) {
+              return @"00000000-0000-0000-0000-000000000001";
+          }
+
+          static NSString *OwnerDevice(void) {
+              NSString *s = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
+              return s.length ? s : @"OWNER-LOCAL-DEVICE";
+          }
+
+          static NSString *OwnerTimestamp(void) {
+              return [NSString stringWithFormat:@"%.0f", [[NSDate date] timeIntervalSince1970]];
+          }
+
+          static void PersistOwnerState(id obj, NSString *email, NSString *key, NSString *device) {
+              if (!obj) return;
+              email = email.length ? email : OwnerEmail();
+              key = key.length ? key : OwnerKey();
+              device = device.length ? device : OwnerDevice();
+              NSString *expires = @"2099-12-31 23:59:59";
+              NSString *session = @"owner-local-session";
+              NSString *timestamp = OwnerTimestamp();
+              SEL saveSel = NSSelectorFromString(@"saveAuthenticationState:withExpirationDate:email:licenseKey:deviceIdentifier:sessionToken:timestamp:");
+              if ([obj respondsToSelector:saveSel]) {
+                  typedef void (*SaveFn)(id, SEL, BOOL, id, id, id, id, id, id);
+                  ((SaveFn)objc_msgSend)(obj, saveSel, YES, expires, email, key, device, session, timestamp);
+              }
+              NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+              [d setBool:YES forKey:@"ttk_HasAcknowledgedSubscription"];
+              [d setBool:YES forKey:@"TTKPlus_Enabled"];
+              [d setBool:YES forKey:@"Enabledttk"];
+              [d setBool:YES forKey:@"Enabledttk_status"];
+              [d synchronize];
+          }
+
+          static BOOL OwnerYes(id self, SEL _cmd, id value) {
+              return YES;
+          }
+
+          static void OwnerCheck(id self, SEL _cmd) {
+              PersistOwnerState(self, nil, nil, nil);
+          }
+
+          static void OwnerAuth(id self, SEL _cmd, id email, id key) {
+              PersistOwnerState(self, email, key, nil);
+              SEL hide = NSSelectorFromString(@"hideLoadingIndicator");
+              if ([self respondsToSelector:hide]) ((void(*)(id,SEL))objc_msgSend)(self, hide);
+          }
+
+          static void OwnerVerify(id self, SEL _cmd, id email, id key, id device) {
+              PersistOwnerState(self, email, key, device);
+          }
+
+          static void OwnerRestore(id self, SEL _cmd, id email) {
+              PersistOwnerState(self, email, nil, nil);
+          }
+
+          static void Noop0(id self, SEL _cmd) {}
+          static void Noop1(id self, SEL _cmd, id a) {}
+          static void Noop2(id self, SEL _cmd, id a, id b) {}
+
+          static void Replace(Class cls, NSString *name, IMP imp) {
+              Method m = class_getInstanceMethod(cls, NSSelectorFromString(name));
+              if (m) method_setImplementation(m, imp);
+          }
+
+          static BOOL InstallOwnerHooks(void) {
+              Class auth = objc_getClass("DownloadsControllerttk");
+              if (!auth) return NO;
+
+              Replace(auth, @"isValidEmail:", (IMP)OwnerYes);
+              Replace(auth, @"isValidLicenseKey:", (IMP)OwnerYes);
+              Replace(auth, @"checkAuthenticationStatus", (IMP)OwnerCheck);
+              Replace(auth, @"authenticateUserWithEmail:licenseKey:", (IMP)OwnerAuth);
+              Replace(auth, @"verifyLicenseWithEmail:licenseKey:deviceIdentifier:", (IMP)OwnerVerify);
+              Replace(auth, @"restoreLicenseWithEmail:", (IMP)OwnerRestore);
+              Replace(auth, @"showInvalidLicenseText", (IMP)Noop0);
+              Replace(auth, @"showNoInternetText", (IMP)Noop0);
+              Replace(auth, @"promptForEmail", (IMP)Noop0);
+              Replace(auth, @"promptForActivation", (IMP)Noop0);
+              Replace(auth, @"promptForRestore", (IMP)Noop0);
+              Replace(auth, @"promptForLicenseKeyWithEmail:", (IMP)Noop1);
+
+              Class web = objc_getClass("ModernWebViewController");
+              if (web) {
+                  Replace(web, @"handlePaymentWithScheme:method:", (IMP)Noop2);
+                  Replace(web, @"handleBuyNewPayment:", (IMP)Noop1);
+                  Replace(web, @"handleRenewalPayment:", (IMP)Noop1);
+                  Replace(web, @"handleStoreBuyPayment:", (IMP)Noop1);
+                  Replace(web, @"handleStoreAddPayment:", (IMP)Noop1);
+              }
+
+              Class root = objc_getClass("RootOptionsController");
+              if (root) Replace(root, @"_setupActivationCell:", (IMP)Noop1);
+
+              [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"ttk_HasAcknowledgedSubscription"];
+              return YES;
+          }
+
+          static void RetryInstall(int remaining) {
+              if (InstallOwnerHooks() || remaining <= 0) return;
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+                  RetryInstall(remaining - 1);
+              });
+          }
+
+          __attribute__((constructor)) static void OwnerOverrideInit(void) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  RetryInstall(100);
+              });
+          }
+          OBJC
+
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -dynamiclib -fobjc-arc -fblocks \
+            -miphoneos-version-min=15.0 -isysroot "$SDK" \
+            -framework Foundation -framework UIKit \
+            -install_name '@loader_path/OwnerOverride.dylib' \
+            build/OwnerOverride.m -o "$APP/Frameworks/OwnerOverride.dylib"
+          file "$APP/Frameworks/OwnerOverride.dylib"
+
+      - name: Load owner override from TTKPlus
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$APP/Frameworks/TTKPlus.dylib"
+          python3 - "$D" <<'PY'
+          import struct, sys, pathlib
+          p=pathlib.Path(sys.argv[1])
+          b=bytearray(p.read_bytes())
+          if len(b) < 64:
+              raise SystemExit('Mach-O too small')
+          magic=struct.unpack_from('<I',b,0)[0]
+          if magic != 0xfeedfacf:
+              raise SystemExit(f'expected thin little-endian Mach-O 64, got {magic:#x}')
+          ncmds=struct.unpack_from('<I',b,16)[0]
+          sizeofcmds=struct.unpack_from('<I',b,20)[0]
+          path=b'@loader_path/OwnerOverride.dylib\0'
+          cmdsize=(24+len(path)+7)&~7
+          off=32+sizeofcmds
+          if off+cmdsize > 0x4000:
+              raise SystemExit('not enough Mach-O header padding')
+          if any(b[off:off+cmdsize]):
+              raise SystemExit('Mach-O header padding is not empty')
+          cmd=bytearray(cmdsize)
+          struct.pack_into('<IIIIII',cmd,0,0xc,cmdsize,24,0,0,0)
+          cmd[24:24+len(path)]=path
+          b[off:off+cmdsize]=cmd
+          struct.pack_into('<I',b,16,ncmds+1)
+          struct.pack_into('<I',b,20,sizeofcmds+cmdsize)
+          p.write_bytes(b)
+          print('inserted LC_LOAD_DYLIB', path[:-1].decode(), 'at', hex(off), 'cmdsize', cmdsize)
+          PY
+
+          codesign --remove-signature "$APP/Frameworks/OwnerOverride.dylib" 2>/dev/null || true
+          codesign --remove-signature "$D" 2>/dev/null || true
+          codesign --force --sign - "$APP/Frameworks/OwnerOverride.dylib"
+          codesign --force --sign - "$D"
+
+      - name: Validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          D="$APP/Frameworks/TTKPlus.dylib"
+          O="$APP/Frameworks/OwnerOverride.dylib"
+          otool -L "$D" | tee build/ttkplus-loads.txt
+          grep -F '@loader_path/OwnerOverride.dylib' build/ttkplus-loads.txt
+          otool -L "$O" | tee build/owner-loads.txt
+          file "$D" "$O" | tee build/file.txt
+          codesign --verify --verbose=2 "$D"
+          codesign --verify --verbose=2 "$O"
+          strings -a "$O" | grep -F 'owner-local-session'
+          strings -a "$O" | grep -F 'saveAuthenticationState:withExpirationDate:email:licenseKey:deviceIdentifier:sessionToken:timestamp:'
+
+          OUT="$GITHUB_WORKSPACE/TikTok_46.8_TTKillerPlus_2.1_Owner_NoLicense.ipa"
+          rm -f "$OUT"
+          (cd work && zip -qry "$OUT" Payload)
+          unzip -tq "$OUT"
+          ls -lh "$OUT"
+          shasum -a 256 "$OUT" | tee build/sha256.txt
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
         with:
-          name: ttkiller-entitlement-disassembly
-          path: out/
+          name: TikTok-46.8-TTKillerPlus-2.1-Owner-NoLicense
+          path: TikTok_46.8_TTKillerPlus_2.1_Owner_NoLicense.ipa
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: owner-build-validation
+          path: build/*.txt
           retention-days: 3
