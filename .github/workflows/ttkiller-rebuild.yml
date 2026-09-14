@@ -1,0 +1,42 @@
+name: Build TTKPlus Free replacement
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [temp/ttkiller-license-free]
+    paths:
+      - 'TTKPlusFree/**'
+      - '.github/workflows/ttkiller-rebuild.yml'
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build arm64 iOS dylib
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -target arm64-apple-ios15.0 \
+            -fobjc-arc -fblocks -O2 -Wall -Wextra \
+            -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter \
+            -isysroot "$SDK" \
+            -dynamiclib TTKPlusFree/TTKPlusFree.m \
+            -framework Foundation -framework UIKit -framework Photos -framework QuartzCore \
+            -install_name '@rpath/TTKPlusFree.dylib' \
+            -Wl,-dead_strip \
+            -o dist/TTKPlusFree.dylib
+          file dist/TTKPlusFree.dylib
+          xcrun vtool -show-build dist/TTKPlusFree.dylib || true
+          xcrun otool -L dist/TTKPlusFree.dylib
+          nm -u dist/TTKPlusFree.dylib | head -100 || true
+          shasum -a 256 dist/TTKPlusFree.dylib > dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TTKPlusFree-dylib
+          path: dist/
+          retention-days: 7
