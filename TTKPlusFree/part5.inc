@@ -25,7 +25,7 @@ static void hkLike1(id self,SEL _cmd,id arg){ NSString*k=[NSStringFromClass([sel
 static void hkLoop1(id self,SEL _cmd,id arg){ if(TTKOn(@"TTKPlus_LoopMode"))return;IMP o=TTKOriginal(self,_cmd);if(o)((void(*)(id,SEL,id))o)(self,_cmd,arg); }
 
 static void TTKInstallHooks(void) {
-    int n=objc_getClassList(NULL,0); if(n<=0)return; Class *classes=calloc((size_t)n,sizeof(Class)); n=objc_getClassList(classes,n);
+    int n=objc_getClassList(NULL,0); if(n<=0)return; Class __unsafe_unretained *classes=(Class __unsafe_unretained *)calloc((size_t)n,sizeof(Class)); n=objc_getClassList(classes,n);
     SEL sHasAd=sel_registerName("hasAd"), sAds=sel_registerName("isAds"), sSoft=sel_registerName("isSoftAds"), sProfile=sel_registerName("p_shouldReportProfileView"), sProfileUser=sel_registerName("p_shouldReportHasVeiwedProfileForUser:"), sReport=sel_registerName("reportProfileView"), sBig=sel_registerName("isUserRecommendBigCard"), sShowMask=sel_registerName("showMask");
     SEL sView=sel_registerName("viewDidAppear:"), sBottom=sel_registerName("updateBottomBar"), sFollow=sel_registerName("onFollowViewClicked:"), sLike0=sel_registerName("onLikeButtonClicked"), sLike1=sel_registerName("onLikeAction:"), sLoop=sel_registerName("playerWillLoopPlay:");
     for(int i=0;i<n;i++) { Class c=classes[i]; if(!TTKInterestingClass(c))continue;
