@@ -1,0 +1,6 @@
+#include "part1.inc"
+#include "part2.inc"
+#include "part3.inc"
+#include "part4a.inc"
+#include "part4b.inc"
+#include "part5.inc"
