@@ -1,0 +1,75 @@
+name: TTKillerPlus IPA inspect
+
+on:
+  push:
+    branches:
+      - temp/ttkiller-license-free
+    paths:
+      - .github/workflows/ttkiller-inspect.yml
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Download IPA
+        shell: bash
+        run: |
+          set -euxo pipefail
+          URL='https://ikghd.site/ipa/TikTok_46.8_TTKillerPlus_2.1.ipa'
+          curl -L --fail --retry 3 --retry-delay 2 \
+            -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Safari/537.36' \
+            -e 'https://repo.ikghd.me/TTKPlus' \
+            -o TikTok_46.8_TTKillerPlus_2.1.ipa "$URL"
+          ls -lh TikTok_46.8_TTKillerPlus_2.1.ipa
+          file TikTok_46.8_TTKillerPlus_2.1.ipa
+          unzip -tq TikTok_46.8_TTKillerPlus_2.1.ipa | tail -20
+
+      - name: Extract and inspect licensing surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf work
+          mkdir work
+          ditto -x -k TikTok_46.8_TTKillerPlus_2.1.ipa work
+          APP="$(find work/Payload -maxdepth 1 -type d -name '*.app' | head -1)"
+          echo "APP=$APP" | tee inspection.txt
+          echo '=== suspicious filenames ===' | tee -a inspection.txt
+          find "$APP" -type f | grep -Ei 'ttkiller|ttk|killer|license|licen[cs]|premium|purchase|subscription|payment|ikg|karwan' | tee -a inspection.txt || true
+          echo '=== embedded dylibs/framework executables ===' | tee -a inspection.txt
+          find "$APP" \( -name '*.dylib' -o -path '*/Frameworks/*.framework/*' \) -type f -maxdepth 8 | while read -r f; do
+            if file "$f" | grep -q 'Mach-O'; then echo "$f"; fi
+          done | tee -a inspection.txt
+          echo '=== Mach-O licensing strings ===' | tee -a inspection.txt
+          find "$APP" -type f -maxdepth 8 | while read -r f; do
+            file "$f" 2>/dev/null | grep -q 'Mach-O' || continue
+            hits="$(strings -a "$f" 2>/dev/null | grep -Ei 'license|licen[cs]ed|activate|activation|premium|purchase|subscription|subscribed|payment|receipt|entitlement|restore|buy_license|renew_license|ttkiller|ttkplus|ikghd|karwan' | head -120 || true)"
+            if [ -n "$hits" ]; then
+              echo "--- $f ---"
+              printf '%s\n' "$hits"
+              echo
+            fi
+          done | tee -a inspection.txt
+          echo '=== linked libraries for suspicious Mach-O files ===' | tee -a inspection.txt
+          find "$APP" -type f -maxdepth 8 | while read -r f; do
+            file "$f" 2>/dev/null | grep -q 'Mach-O' || continue
+            if strings -a "$f" 2>/dev/null | grep -Eqi 'buy_license|activate_new_license|renew_license|restore_license|TTKiller|TTKPlus'; then
+              echo "--- $f ---"
+              otool -L "$f" || true
+              echo '--- symbols ---'
+              nm -gjU "$f" 2>/dev/null | grep -Ei 'license|activate|premium|purchase|subscription|payment|entitlement|restore|ttkiller|ttkplus|ikghd|karwan' | head -200 || true
+              echo
+            fi
+          done | tee -a inspection.txt
+          cp "$APP/Info.plist" app-Info.plist || true
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: ttkiller-inspection
+          path: |
+            inspection.txt
+            app-Info.plist
+          if-no-files-found: error
+          retention-days: 3
