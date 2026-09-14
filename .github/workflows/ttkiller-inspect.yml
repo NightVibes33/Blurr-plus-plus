@@ -1,4 +1,4 @@
-name: TTKillerPlus metadata inspect
+name: TTKillerPlus entitlement disassembly
 
 on:
   push:
@@ -28,7 +28,7 @@ jobs:
           const browser=await chromium.launch({headless:true});
           const ctx=await browser.newContext({acceptDownloads:true,userAgent:'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36'});
           const page=await ctx.newPage();
-          let resp=await page.goto(PAGE,{waitUntil:'domcontentloaded',timeout:120000});
+          const resp=await page.goto(PAGE,{waitUntil:'domcontentloaded',timeout:120000});
           console.log('repo',resp?.status(),page.url(),await page.title());
           await page.waitForTimeout(5000);
           const link=page.locator(`a[href*="TikTok_46.8_TTKillerPlus_2.1.ipa"]`).first();
@@ -54,23 +54,45 @@ jobs:
           cd ..
           unzip -tq TikTok.ipa >/dev/null
 
-      - name: Extract Objective-C metadata
+      - name: Disassemble entitlement methods
         shell: bash
         run: |
           set -euo pipefail
           rm -rf work out && mkdir work out
           ditto -x -k TikTok.ipa work
           D="$(find work/Payload -path '*/Frameworks/TTKPlus.dylib' -type f | head -1)"
-          file "$D" > out/file.txt
-          otool -L "$D" > out/linked.txt || true
-          nm -nm "$D" > out/nm.txt 2>&1 || true
-          strings -a "$D" > out/strings.txt
-          otool -ov "$D" > out/objc-meta.txt 2>&1 || true
-          grep -iE -B40 -A40 'isValidLicenseKey|verifyLicenseWithEmail|authenticateUserWithEmail|saveAuthenticationState|license|auth|subscr|session|expir' out/objc-meta.txt > out/auth-context.txt || true
-          grep -iE 'license|auth|subscr|session|expir|valid|verify|active' out/strings.txt > out/auth-strings.txt || true
+          otool -l "$D" > out/load-commands.txt
+          otool -tvV "$D" > out/disasm-all.txt
+          python3 - <<'PY'
+          import re, pathlib
+          p=pathlib.Path('out/disasm-all.txt')
+          lines=p.read_text(errors='ignore').splitlines()
+          targets=[
+            ('authenticateUserWithEmail_licenseKey',0x48324,0x49fdc),
+            ('verifyLicenseWithEmail_licenseKey_deviceIdentifier',0x49fdc,0x4ade0),
+            ('checkAuthenticationStatus',0x4ade0,0x4b038),
+            ('saveAuthenticationState',0x4b038,0x4b924),
+            ('settingsTkVerify',0x4b924,0x4b958),
+            ('isValidEmail',0x4b958,0x4b9d8),
+            ('isValidLicenseKey',0x4b9d8,0x4ba4c),
+            ('setupActivationCell',0x526e8,0x52a00),
+          ]
+          addr_re=re.compile(r'^([0-9a-fA-F]{8,16})\s')
+          parsed=[]
+          for idx,line in enumerate(lines):
+              m=addr_re.match(line)
+              if m: parsed.append((int(m.group(1),16),idx))
+          for name,start,end in targets:
+              selected=[]
+              for addr,idx in parsed:
+                  if start <= addr < end:
+                      selected.append(lines[idx])
+              pathlib.Path(f'out/{name}.txt').write_text('\n'.join(selected)+'\n')
+          PY
+          rm out/disasm-all.txt
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ttkiller-objc-metadata
+          name: ttkiller-entitlement-disassembly
           path: out/
           retention-days: 3
