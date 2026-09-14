@@ -26,7 +26,7 @@ jobs:
             -Wno-unused-function -Wno-unused-variable -Wno-unused-parameter \
             -isysroot "$SDK" \
             -dynamiclib TTKPlusFree/TTKPlusFree.m \
-            -framework Foundation -framework UIKit -framework Photos -framework QuartzCore \
+            -framework Foundation -framework UIKit -framework Photos -framework QuartzCore -framework CoreGraphics \
             -install_name '@rpath/TTKPlusFree.dylib' \
             -Wl,-dead_strip \
             -o dist/TTKPlusFree.dylib
