@@ -19,15 +19,36 @@ jobs:
           npm install --silent playwright
           npx playwright install chromium >/dev/null
           cat > fetch.mjs <<'JS'
-          import { chromium } from 'playwright'; import fs from 'fs'; import path from 'path';
+          import { chromium } from 'playwright';
+          import fs from 'fs';
+          import path from 'path';
+          const PAGE='https://repo.ikghd.me/TTKPlus';
+          const URL='https://ikghd.site/ipa/TikTok_46.8_TTKillerPlus_2.1.ipa';
+          const OUT=path.resolve('..','TikTok.ipa');
           const browser=await chromium.launch({headless:true});
-          const ctx=await browser.newContext({acceptDownloads:true});
+          const ctx=await browser.newContext({acceptDownloads:true,userAgent:'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36'});
           const page=await ctx.newPage();
-          await page.goto('https://repo.ikghd.me/TTKPlus',{waitUntil:'domcontentloaded',timeout:120000});
-          await page.waitForTimeout(3000);
-          const link=page.locator('a[href*="TikTok_46.8_TTKillerPlus_2.1.ipa"]').first();
-          const [dl]=await Promise.all([page.waitForEvent('download',{timeout:180000}),link.click({timeout:30000})]);
-          const out=path.resolve('..','TikTok.ipa'); await dl.saveAs(out); console.log(fs.statSync(out).size); await browser.close();
+          let resp=await page.goto(PAGE,{waitUntil:'domcontentloaded',timeout:120000});
+          console.log('repo',resp?.status(),page.url(),await page.title());
+          await page.waitForTimeout(5000);
+          const link=page.locator(`a[href*="TikTok_46.8_TTKillerPlus_2.1.ipa"]`).first();
+          console.log('matching links',await link.count());
+          let download;
+          if (await link.count()) {
+            [download]=await Promise.all([
+              page.waitForEvent('download',{timeout:180000}),
+              link.click({timeout:30000})
+            ]);
+          } else {
+            const p2=await ctx.newPage();
+            const dp=p2.waitForEvent('download',{timeout:180000});
+            try { await p2.goto(URL,{waitUntil:'commit',timeout:120000}); } catch(e) { console.log(String(e)); }
+            download=await dp;
+          }
+          console.log('download suggested',download.suggestedFilename());
+          await download.saveAs(OUT);
+          console.log('saved',fs.statSync(OUT).size);
+          await browser.close();
           JS
           node fetch.mjs
           cd ..
@@ -37,7 +58,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir work out
+          rm -rf work out && mkdir work out
           ditto -x -k TikTok.ipa work
           D="$(find work/Payload -path '*/Frameworks/TTKPlus.dylib' -type f | head -1)"
           file "$D" > out/file.txt
@@ -45,7 +66,7 @@ jobs:
           nm -nm "$D" > out/nm.txt 2>&1 || true
           strings -a "$D" > out/strings.txt
           otool -ov "$D" > out/objc-meta.txt 2>&1 || true
-          grep -iE -B30 -A30 'license|auth|subscr|session|expir|valid|verify|active' out/objc-meta.txt > out/auth-context.txt || true
+          grep -iE -B40 -A40 'isValidLicenseKey|verifyLicenseWithEmail|authenticateUserWithEmail|saveAuthenticationState|license|auth|subscr|session|expir' out/objc-meta.txt > out/auth-context.txt || true
           grep -iE 'license|auth|subscr|session|expir|valid|verify|active' out/strings.txt > out/auth-strings.txt || true
 
       - uses: actions/upload-artifact@v4
