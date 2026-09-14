@@ -1,0 +1,125 @@
+name: Temp CapCut Sideload Allowed IPA
+
+on:
+  push:
+    branches:
+      - temp/capcut-cookie-seed-20260914
+    paths:
+      - '.github/workflows/temp-capcut-sideload-allowed.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-sideload-ipa:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Download prior full IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CapCutPatched-IPA
+          path: source
+          repository: NightVibes33/Blurr-plus-plus
+          run-id: 34875893678
+          github-token: ${{ github.token }}
+
+      - name: Reconstruct clean AppAssassin bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh source
+          test -f source/CapCutPatched.ipa
+          mkdir work
+          cd work
+          unzip -q ../source/CapCutPatched.ipa
+          APP='Payload/CapCut.app'
+
+          # Remove files added by the earlier cookie bootstrap experiment.
+          rm -f "$APP/Frameworks/CapCutCookieBootstrap.dylib"
+          rm -f "$APP/CapCutSeedCookies.binarycookies"
+
+          # Restore BDLRepairer byte-for-byte to the original AppAssassin state.
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct, hashlib
+          p=Path('Payload/CapCut.app/Frameworks/BDLRepairer.framework/BDLRepairer')
+          d=bytearray(p.read_bytes())
+          ncmds,sizeofcmds=struct.unpack_from('<II',d,16)
+          assert (ncmds,sizeofcmds)==(22,2544),(ncmds,sizeofcmds)
+          struct.pack_into('<II',d,16,21,2464)
+          d[2496:2576]=b'\0'*80
+          p.write_bytes(d)
+          h=hashlib.sha256(d).hexdigest()
+          assert h=='b8b31216fb4d18511d3f216a32b723e5033a1e29a91aa54ba8e49e0da562fcbb',h
+          print('Restored BDLRepairer SHA256',h)
+          PY
+
+          # The main executable must still be the untouched AppAssassin binary here.
+          echo '88b4f6a9362830a3505eb3943b930d0aa6f2959e48db956524e8805642a5a839  Payload/CapCut.app/CapCut' | shasum -a 256 -c -
+
+      - name: Patch sideload compliance response path
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct, hashlib
+          p=Path('Payload/CapCut.app/CapCut')
+          d=bytearray(p.read_bytes())
+          off=0x1e90c28
+          old=struct.unpack_from('<I',d,off)[0]
+          assert old==0x36000b61,hex(old)
+          # Original: tbz w1,#0,0x101e90d94
+          # Sideload channel: always take the non-popup/failure path for the
+          # server-fed compliance_popups response. This prevents the backend
+          # security notice from being consumed by this sideload build.
+          new=0x1400005b
+          struct.pack_into('<I',d,off,new)
+          p.write_bytes(d)
+          print('Patched instruction',hex(old),'->',hex(new),'at',hex(off))
+          print('Main SHA256',hashlib.sha256(d).hexdigest())
+          PY
+
+      - name: Validate no injected dylib or seed resource
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          test ! -e Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib
+          test ! -e Payload/CapCut.app/CapCutSeedCookies.binarycookies
+          test "$(find Payload/CapCut.app -name 'CapCutCookieBootstrap*' -print | wc -l | tr -d ' ')" = '0'
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          p=Path('Payload/CapCut.app/Frameworks/BDLRepairer.framework/BDLRepairer')
+          d=p.read_bytes()
+          assert struct.unpack_from('<II',d,16)==(21,2464)
+          assert d[2496:2576]==b'\0'*80
+          print('No custom loader remains in BDLRepairer')
+          PY
+
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          /usr/bin/zip -qry -1 ../CapCut_v19.4.0_SideloadAllowed_NoDylib.ipa Payload
+          cd ..
+          unzip -tq CapCut_v19.4.0_SideloadAllowed_NoDylib.ipa
+          shasum -a 256 CapCut_v19.4.0_SideloadAllowed_NoDylib.ipa | tee SHA256.txt
+          ls -lh CapCut_v19.4.0_SideloadAllowed_NoDylib.ipa
+
+      - name: Upload full IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CapCut-SideloadAllowed-NoDylib-IPA
+          path: |
+            CapCut_v19.4.0_SideloadAllowed_NoDylib.ipa
+            SHA256.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
