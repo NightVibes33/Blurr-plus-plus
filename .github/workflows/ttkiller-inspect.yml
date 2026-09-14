@@ -11,20 +11,61 @@ on:
 jobs:
   inspect:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - name: Download IPA
         shell: bash
         run: |
           set -euxo pipefail
           URL='https://ikghd.site/ipa/TikTok_46.8_TTKillerPlus_2.1.ipa'
-          curl -L --fail --retry 3 --retry-delay 2 \
-            -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Safari/537.36' \
-            -e 'https://repo.ikghd.me/TTKPlus' \
-            -o TikTok_46.8_TTKillerPlus_2.1.ipa "$URL"
-          ls -lh TikTok_46.8_TTKillerPlus_2.1.ipa
-          file TikTok_46.8_TTKillerPlus_2.1.ipa
-          unzip -tq TikTok_46.8_TTKillerPlus_2.1.ipa | tail -20
+          PAGE='https://repo.ikghd.me/TTKPlus'
+          OUT='TikTok_46.8_TTKillerPlus_2.1.ipa'
+
+          rm -f "$OUT" cookies.txt repo.html
+
+          # Prime the session from the public repo page first.
+          curl -L -sS -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/140.0 Safari/537.36' \
+            -c cookies.txt -o repo.html "$PAGE" || true
+
+          # Try the normal browser-session request.
+          curl -L --fail --retry 2 --retry-delay 2 \
+            -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/140.0 Safari/537.36' \
+            -H 'Accept: application/octet-stream,application/zip,*/*;q=0.8' \
+            -H 'Sec-Fetch-Dest: document' \
+            -H 'Sec-Fetch-Mode: navigate' \
+            -H 'Sec-Fetch-Site: same-site' \
+            -b cookies.txt -c cookies.txt \
+            -e "$PAGE" \
+            -o "$OUT" "$URL" || true
+
+          # Cloudflare-aware fallback.
+          if [ ! -s "$OUT" ] || ! unzip -tq "$OUT" >/dev/null 2>&1; then
+            rm -f "$OUT"
+            python3 -m pip install --quiet --disable-pip-version-check cloudscraper
+            python3 - <<'PY'
+          import cloudscraper, pathlib, sys
+          page='https://repo.ikghd.me/TTKPlus'
+          url='https://ikghd.site/ipa/TikTok_46.8_TTKillerPlus_2.1.ipa'
+          out=pathlib.Path('TikTok_46.8_TTKillerPlus_2.1.ipa')
+          s=cloudscraper.create_scraper(browser={'browser':'chrome','platform':'darwin','mobile':False})
+          p=s.get(page, timeout=45)
+          print('repo page:', p.status_code, p.url, len(p.content))
+          r=s.get(url, headers={'Referer':page,'Accept':'application/octet-stream,application/zip,*/*;q=0.8'}, stream=True, timeout=120)
+          print('ipa:', r.status_code, r.url, r.headers.get('content-type'), r.headers.get('content-length'))
+          if r.status_code >= 400:
+              print(r.text[:1500])
+              sys.exit(1)
+          with out.open('wb') as f:
+              for chunk in r.iter_content(1024*1024):
+                  if chunk:
+                      f.write(chunk)
+          print('saved', out.stat().st_size)
+          PY
+          fi
+
+          ls -lh "$OUT"
+          file "$OUT"
+          unzip -tq "$OUT" | tail -20
 
       - name: Extract and inspect licensing surfaces
         shell: bash
@@ -44,7 +85,7 @@ jobs:
           echo '=== Mach-O licensing strings ===' | tee -a inspection.txt
           find "$APP" -type f -maxdepth 8 | while read -r f; do
             file "$f" 2>/dev/null | grep -q 'Mach-O' || continue
-            hits="$(strings -a "$f" 2>/dev/null | grep -Ei 'license|licen[cs]ed|activate|activation|premium|purchase|subscription|subscribed|payment|receipt|entitlement|restore|buy_license|renew_license|ttkiller|ttkplus|ikghd|karwan' | head -120 || true)"
+            hits="$(strings -a "$f" 2>/dev/null | grep -Ei 'license|licen[cs]ed|activate|activation|premium|purchase|subscription|subscribed|payment|receipt|entitlement|restore|buy_license|renew_license|ttkiller|ttkplus|ikghd|karwan' | head -160 || true)"
             if [ -n "$hits" ]; then
               echo "--- $f ---"
               printf '%s\n' "$hits"
@@ -58,7 +99,7 @@ jobs:
               echo "--- $f ---"
               otool -L "$f" || true
               echo '--- symbols ---'
-              nm -gjU "$f" 2>/dev/null | grep -Ei 'license|activate|premium|purchase|subscription|payment|entitlement|restore|ttkiller|ttkplus|ikghd|karwan' | head -200 || true
+              nm -gjU "$f" 2>/dev/null | grep -Ei 'license|activate|premium|purchase|subscription|payment|entitlement|restore|ttkiller|ttkplus|ikghd|karwan' | head -250 || true
               echo
             fi
           done | tee -a inspection.txt
