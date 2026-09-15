@@ -1,4 +1,4 @@
-name: Temp CapCut Hardcoded Cookie IPA
+name: Temp CapCut Sideload-Tolerant IPA
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 jobs:
-  build-hardcoded-cookie-ipa:
+  build-sideload-tolerant-ipa:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -140,6 +140,40 @@ jobs:
           strings work/Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib | grep -F 'Library/Cookies'
           strings work/Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib | grep -F 'Cookies.binarycookies'
 
+      - name: Allow developer and sideloaded installs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          binary = Path('work/Payload/CapCut.app/CapCut')
+          data = binary.read_bytes()
+          patches = [
+              (b'fbv_identify_anti_crack\x00', b'dev_identify_anti_crack\x00'),
+              (b'ios_security_config\x00', b'ios_security_noopxx\x00'),
+          ]
+
+          for old, new in patches:
+              assert len(old) == len(new)
+              count = data.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one {old!r}, found {count}')
+              data = data.replace(old, new, 1)
+              print(f'patched {old[:-1].decode()} -> {new[:-1].decode()}')
+
+          binary.write_bytes(data)
+
+          verify = binary.read_bytes()
+          for old, new in patches:
+              assert old not in verify
+              assert verify.count(new) == 1
+          PY
+          strings work/Payload/CapCut.app/CapCut | grep -F 'dev_identify_anti_crack'
+          strings work/Payload/CapCut.app/CapCut | grep -F 'ios_security_noopxx'
+          if strings work/Payload/CapCut.app/CapCut | grep -F 'fbv_identify_anti_crack'; then exit 1; fi
+          if strings work/Payload/CapCut.app/CapCut | grep -F 'ios_security_config'; then exit 1; fi
+
       - name: Remove external seed and stale signatures
         shell: bash
         run: |
@@ -154,22 +188,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -f CapCutPatched-HardcodedCookie.ipa
-          (cd work && zip -qry -1 "$GITHUB_WORKSPACE/CapCutPatched-HardcodedCookie.ipa" Payload)
-          unzip -tq CapCutPatched-HardcodedCookie.ipa
-          if unzip -l CapCutPatched-HardcodedCookie.ipa | grep -F 'CapCutSeedCookies.binarycookies'; then
+          rm -f CapCutPatched-SideloadAllowed.ipa
+          (cd work && zip -qry -1 "$GITHUB_WORKSPACE/CapCutPatched-SideloadAllowed.ipa" Payload)
+          unzip -tq CapCutPatched-SideloadAllowed.ipa
+          if unzip -l CapCutPatched-SideloadAllowed.ipa | grep -F 'CapCutSeedCookies.binarycookies'; then
             echo 'External seed cookie unexpectedly remains in IPA' >&2
             exit 1
           fi
-          shasum -a 256 CapCutPatched-HardcodedCookie.ipa | tee IPA-SHA256.txt
-          ls -lh CapCutPatched-HardcodedCookie.ipa
+          shasum -a 256 CapCutPatched-SideloadAllowed.ipa | tee IPA-SHA256.txt
+          ls -lh CapCutPatched-SideloadAllowed.ipa
 
-      - name: Upload full hardcoded-cookie IPA
+      - name: Upload full sideload-tolerant IPA
         uses: actions/upload-artifact@v4
         with:
-          name: CapCutPatched-HardcodedCookie-IPA
+          name: CapCutPatched-SideloadAllowed-IPA
           path: |
-            CapCutPatched-HardcodedCookie.ipa
+            CapCutPatched-SideloadAllowed.ipa
             IPA-SHA256.txt
             cookie-sha256.txt
           if-no-files-found: error
