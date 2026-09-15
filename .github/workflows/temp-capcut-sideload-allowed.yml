@@ -37,11 +37,9 @@ jobs:
           unzip -q ../source/CapCutPatched.ipa
           APP='Payload/CapCut.app'
 
-          # Remove files added by the earlier cookie bootstrap experiment.
           rm -f "$APP/Frameworks/CapCutCookieBootstrap.dylib"
           rm -f "$APP/CapCutSeedCookies.binarycookies"
 
-          # Restore BDLRepairer byte-for-byte to the original AppAssassin state.
           python3 - <<'PY'
           from pathlib import Path
           import struct, hashlib
@@ -57,34 +55,42 @@ jobs:
           print('Restored BDLRepairer SHA256',h)
           PY
 
-          # The main executable must still be the untouched AppAssassin binary here.
           echo '88b4f6a9362830a3505eb3943b930d0aa6f2959e48db956524e8805642a5a839  Payload/CapCut.app/CapCut' | shasum -a 256 -c -
 
-      - name: Patch sideload compliance response path
+      - name: Patch only sideload security reporting toggles
         shell: bash
         run: |
           set -euo pipefail
           cd work
           python3 - <<'PY'
           from pathlib import Path
-          import struct, hashlib
+          import hashlib
+
           p=Path('Payload/CapCut.app/CapCut')
-          d=bytearray(p.read_bytes())
-          off=0x1e90c28
-          old=struct.unpack_from('<I',d,off)[0]
-          assert old==0x36000b61,hex(old)
-          # Original: tbz w1,#0,0x101e90d94
-          # Sideload channel: always take the non-popup/failure path for the
-          # server-fed compliance_popups response. This prevents the backend
-          # security notice from being consumed by this sideload build.
-          new=0x1400005b
-          struct.pack_into('<I',d,off,new)
+          d=p.read_bytes()
+          patches=[
+              (b'fbv_identify_anti_crack\x00', b'dev_identify_anti_crack\x00'),
+              (b'ios_security_config\x00', b'ios_security_noopxx\x00'),
+          ]
+          for old,new in patches:
+              assert len(old)==len(new)
+              count=d.count(old)
+              assert count==1,(old,count)
+              d=d.replace(old,new,1)
+              print(old[:-1].decode(),'->',new[:-1].decode())
           p.write_bytes(d)
-          print('Patched instruction',hex(old),'->',hex(new),'at',hex(off))
-          print('Main SHA256',hashlib.sha256(d).hexdigest())
+          for old,new in patches:
+              assert old not in d
+              assert d.count(new)==1
+          print('Patched main SHA256',hashlib.sha256(d).hexdigest())
           PY
 
-      - name: Validate no injected dylib or seed resource
+          strings Payload/CapCut.app/CapCut | grep -F 'dev_identify_anti_crack'
+          strings Payload/CapCut.app/CapCut | grep -F 'ios_security_noopxx'
+          ! strings Payload/CapCut.app/CapCut | grep -F 'fbv_identify_anti_crack'
+          ! strings Payload/CapCut.app/CapCut | grep -F 'ios_security_config'
+
+      - name: Validate clean no-dylib bundle
         shell: bash
         run: |
           set -euo pipefail
@@ -107,18 +113,18 @@ jobs:
         run: |
           set -euo pipefail
           cd work
-          /usr/bin/zip -qry -1 ../CapCut_v19.4.0_SideloadAllowed_NoDylib.ipa Payload
+          /usr/bin/zip -qry -1 ../CapCut_v19.4.0_SideloadTrustPatch_NoDylib.ipa Payload
           cd ..
-          unzip -tq CapCut_v19.4.0_SideloadAllowed_NoDylib.ipa
-          shasum -a 256 CapCut_v19.4.0_SideloadAllowed_NoDylib.ipa | tee SHA256.txt
-          ls -lh CapCut_v19.4.0_SideloadAllowed_NoDylib.ipa
+          unzip -tq CapCut_v19.4.0_SideloadTrustPatch_NoDylib.ipa
+          shasum -a 256 CapCut_v19.4.0_SideloadTrustPatch_NoDylib.ipa | tee SHA256.txt
+          ls -lh CapCut_v19.4.0_SideloadTrustPatch_NoDylib.ipa
 
       - name: Upload full IPA
         uses: actions/upload-artifact@v4
         with:
-          name: CapCut-SideloadAllowed-NoDylib-IPA
+          name: CapCut-SideloadTrustPatch-NoDylib-IPA
           path: |
-            CapCut_v19.4.0_SideloadAllowed_NoDylib.ipa
+            CapCut_v19.4.0_SideloadTrustPatch_NoDylib.ipa
             SHA256.txt
           if-no-files-found: error
           compression-level: 0
