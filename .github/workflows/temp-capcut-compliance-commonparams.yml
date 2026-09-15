@@ -1,0 +1,234 @@
+name: Temp CapCut Compliance CommonParams Patch
+
+on:
+  push:
+    branches:
+      - temp/capcut-cookie-seed-20260914
+    paths:
+      - '.github/workflows/temp-capcut-compliance-commonparams.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  clean-no-dylib:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Download prior full IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CapCutPatched-IPA
+          path: source
+          repository: NightVibes33/Blurr-plus-plus
+          run-id: 34875893678
+          github-token: ${{ github.token }}
+
+      - name: Reconstruct clean AppAssassin bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f source/CapCutPatched.ipa
+          mkdir work
+          cd work
+          unzip -q ../source/CapCutPatched.ipa
+          APP='Payload/CapCut.app'
+          rm -f "$APP/Frameworks/CapCutCookieBootstrap.dylib"
+          rm -f "$APP/CapCutSeedCookies.binarycookies"
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct, hashlib
+          p=Path('Payload/CapCut.app/Frameworks/BDLRepairer.framework/BDLRepairer')
+          d=bytearray(p.read_bytes())
+          assert struct.unpack_from('<II',d,16)==(22,2544)
+          struct.pack_into('<II',d,16,21,2464)
+          d[2496:2576]=b'\0'*80
+          p.write_bytes(d)
+          h=hashlib.sha256(d).hexdigest()
+          assert h=='b8b31216fb4d18511d3f216a32b723e5033a1e29a91aa54ba8e49e0da562fcbb',h
+          print('Restored BDLRepairer',h)
+          main=Path('Payload/CapCut.app/CapCut')
+          assert hashlib.sha256(main.read_bytes()).hexdigest()=='88b4f6a9362830a3505eb3943b930d0aa6f2959e48db956524e8805642a5a839'
+          PY
+
+      - name: Patch only compliance fetch common params
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct, hashlib
+          p=Path('Payload/CapCut.app/CapCut')
+          d=bytearray(p.read_bytes())
+          base=0x100000000
+          helper=0x10b248eb4
+          cave=0x10bfba5a4
+          generic=0x107c4a284
+          caller_lr=0x10b248e24
+          def off(v): return v-base
+          def enc_b(pc,target):
+              diff=target-pc
+              assert diff%4==0
+              imm=diff//4
+              assert -(1<<25) <= imm < (1<<25)
+              return 0x14000000 | (imm & 0x03ffffff)
+          ho=off(helper); co=off(cave)
+          orig=struct.unpack_from('<IIII',d,ho)
+          assert orig==(0xf2fa0004,0x528000c6,0x52800027,enc_b(helper+0xc,generic)),tuple(hex(x) for x in orig)
+          assert d[co:co+64]==b'\0'*64
+          assert caller_lr==((1<<32)|(0xb24<<16)|0x8e24)
+          code=[
+              0xf2fa0004,
+              0x528000c6,
+              0xd291c488,
+              0xf2a16488,
+              0xf2c00028,
+              0xeb0803df,
+              0x1a9f07e7,
+              enc_b(cave+0x1c,generic),
+          ]
+          for i,ins in enumerate(code): struct.pack_into('<I',d,co+4*i,ins)
+          struct.pack_into('<I',d,ho,enc_b(helper,cave))
+          p.write_bytes(d)
+          print('Patched main SHA256',hashlib.sha256(d).hexdigest())
+          print('Only LR 0x10b248e24 gets w7=0; all other helper callers get w7=1')
+          PY
+          rm -rf Payload/CapCut.app/_CodeSignature
+
+      - name: Validate clean bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          test ! -e Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib
+          test ! -e Payload/CapCut.app/CapCutSeedCookies.binarycookies
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          d=Path('Payload/CapCut.app/CapCut').read_bytes()
+          assert struct.unpack_from('<I',d,0xb248eb4)[0]==0x1435c5bc
+          expected=[0xf2fa0004,0x528000c6,0xd291c488,0xf2a16488,0xf2c00028,0xeb0803df,0x1a9f07e7,0x16f23f31]
+          got=[struct.unpack_from('<I',d,0xbfba5a4+i*4)[0] for i in range(8)]
+          assert got==expected,(got,expected)
+          print('Endpoint-specific common-params thunk verified')
+          PY
+
+      - name: Package clean IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          /usr/bin/zip -qry -1 ../CapCut_v19.4.0_ComplianceNoCommonParams_NoDylib.ipa Payload
+          cd ..
+          unzip -tq CapCut_v19.4.0_ComplianceNoCommonParams_NoDylib.ipa
+          shasum -a 256 CapCut_v19.4.0_ComplianceNoCommonParams_NoDylib.ipa | tee SHA256-clean.txt
+
+      - name: Upload clean IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CapCut-ComplianceNoCommonParams-NoDylib-IPA
+          path: |
+            CapCut_v19.4.0_ComplianceNoCommonParams_NoDylib.ipa
+            SHA256-clean.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  cookie-preserving:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Download hardcoded-cookie IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CapCutPatched-HardcodedCookie-IPA
+          path: source
+          repository: NightVibes33/Blurr-plus-plus
+          run-id: 34883757208
+          github-token: ${{ github.token }}
+
+      - name: Extract source IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          IPA="$(find source -maxdepth 1 -name '*.ipa' -print -quit)"
+          test -n "$IPA"
+          mkdir work
+          unzip -q "$IPA" -d work
+          test -f work/Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib
+          test ! -e work/Payload/CapCut.app/CapCutSeedCookies.binarycookies
+
+      - name: Patch only compliance fetch common params
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct, hashlib
+          p=Path('work/Payload/CapCut.app/CapCut')
+          d=bytearray(p.read_bytes())
+          base=0x100000000
+          helper=0x10b248eb4
+          cave=0x10bfba5a4
+          generic=0x107c4a284
+          caller_lr=0x10b248e24
+          def off(v): return v-base
+          def enc_b(pc,target):
+              diff=target-pc
+              assert diff%4==0
+              imm=diff//4
+              assert -(1<<25) <= imm < (1<<25)
+              return 0x14000000 | (imm & 0x03ffffff)
+          ho=off(helper); co=off(cave)
+          orig=struct.unpack_from('<IIII',d,ho)
+          assert orig==(0xf2fa0004,0x528000c6,0x52800027,enc_b(helper+0xc,generic)),tuple(hex(x) for x in orig)
+          assert d[co:co+64]==b'\0'*64
+          assert caller_lr==((1<<32)|(0xb24<<16)|0x8e24)
+          code=[0xf2fa0004,0x528000c6,0xd291c488,0xf2a16488,0xf2c00028,0xeb0803df,0x1a9f07e7,enc_b(cave+0x1c,generic)]
+          for i,ins in enumerate(code): struct.pack_into('<I',d,co+4*i,ins)
+          struct.pack_into('<I',d,ho,enc_b(helper,cave))
+          p.write_bytes(d)
+          print('Patched main SHA256',hashlib.sha256(d).hexdigest())
+          PY
+          rm -rf work/Payload/CapCut.app/_CodeSignature
+
+      - name: Validate cookie payload and patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f work/Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib
+          strings work/Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib | grep -F 'Library/Cookies'
+          strings work/Payload/CapCut.app/Frameworks/CapCutCookieBootstrap.dylib | grep -F 'Cookies.binarycookies'
+          test ! -e work/Payload/CapCut.app/CapCutSeedCookies.binarycookies
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          d=Path('work/Payload/CapCut.app/CapCut').read_bytes()
+          assert struct.unpack_from('<I',d,0xb248eb4)[0]==0x1435c5bc
+          expected=[0xf2fa0004,0x528000c6,0xd291c488,0xf2a16488,0xf2c00028,0xeb0803df,0x1a9f07e7,0x16f23f31]
+          got=[struct.unpack_from('<I',d,0xbfba5a4+i*4)[0] for i in range(8)]
+          assert got==expected
+          print('Endpoint-specific common-params thunk verified')
+          PY
+
+      - name: Package cookie IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd work && /usr/bin/zip -qry -1 "$GITHUB_WORKSPACE/CapCut_v19.4.0_ComplianceNoCommonParams_HardcodedCookie.ipa" Payload)
+          unzip -tq CapCut_v19.4.0_ComplianceNoCommonParams_HardcodedCookie.ipa
+          shasum -a 256 CapCut_v19.4.0_ComplianceNoCommonParams_HardcodedCookie.ipa | tee SHA256-cookie.txt
+
+      - name: Upload cookie IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CapCut-ComplianceNoCommonParams-HardcodedCookie-IPA
+          path: |
+            CapCut_v19.4.0_ComplianceNoCommonParams_HardcodedCookie.ipa
+            SHA256-cookie.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
